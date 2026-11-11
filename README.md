@@ -52,8 +52,9 @@ about making that hard to get wrong:
 - **Only its own servers.** Everything it deletes carries the label `managed-by=offload-to-hetzner`; your other
   servers in the same project are never touched.
 - **Secrets stay home.** Every upload and every remote command line is scanned for the values of your secret
-  environment variables, your project's `.env` files and common token formats. Nothing is sent when it finds
-  one.
+  environment variables, your project's `.env` files and common token formats, in contents, file names and link
+  targets. Uploads are packed from exactly the bytes that were scanned. Nothing is sent when the scan finds
+  something.
 - **Results are untrusted.** `get` accepts only plain files below the folder you asked for, never merges into or
   overwrites existing files unless you pass `--merge`, never writes into your home folder or a `Library` folder,
   never writes through symlinks, refuses `.git` and git control files, drops execute bits and has a size limit.
@@ -141,6 +142,10 @@ increase") can be approved within seconds.
 - The secret scan cannot recognise secrets it does not know and that have no known format, or customer data in
   ordinary files.
 - Hetzner bills every started hour, even for a five-minute server.
+- Hetzner has restricted the creation of new cloud servers since June 2026 for new customers and some existing
+  ones, citing hardware shortages. If `create` is refused although your limits allow it, that is why.
+- No GPUs: Hetzner Cloud has none (Hetzner's GPU servers are dedicated machines with a setup fee per order), and
+  neither has Vercel Sandbox. For GPU work, use a GPU cloud such as Modal.
 
 ## License
 

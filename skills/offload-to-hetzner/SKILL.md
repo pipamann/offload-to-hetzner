@@ -9,7 +9,7 @@ description: >
   to Vercel's offload-to-sandbox: every server gets its own SSH key, labels, an expiry and a watchdog, and a cx53
   (16 cores, 32 GB) costs about 0.05 EUR per hour.
 metadata:
-  version: "1.0.3"
+  version: "1.1.0"
   homepage: https://github.com/pipamann/offload-to-hetzner
 ---
 
@@ -45,7 +45,8 @@ interactive, and anything that needs data that must not leave the machine (next 
 Secrets and customer data stay local. Upload code, sanitized exports and harmless test data only.
 
 Every upload (`push`, `put`, a `--setup` script) and every command line passes a scan first, and nothing is sent
-when it finds something:
+when it finds something. Uploads are packed on the Mac from exactly the bytes the scan read, so a file another agent
+changes in the meantime cannot slip through. The scan looks at contents, file and folder names, and link targets for:
 
 - the values of all environment variables with secret-like names (`*TOKEN*`, `*KEY*`, `*SECRET*`, `*PASS*` ...,
   from 8 characters, numbers included), every assignment in the files of `$OFFLOAD_SECRET_FILES`, and the
@@ -130,7 +131,8 @@ until it is deleted. `$O types` prints the live price of every type on sale at i
   path; it refuses `.git` in any spelling, git's control files (`.gitattributes`, `.gitmodules`, `.lfsconfig`,
   `HEAD`, `commondir`, `gitdir`) and anything that would plant or complete a git repository; it refuses other
   hidden files unless you pass `--hidden`; it removes execute bits; and it stops above 20 GB
-  (`OFFLOAD_GET_MAX_GB`). Have the job write compact results (a summary, a JSON report, the failing test names)
+  (`OFFLOAD_GET_MAX_GB`) or 200,000 entries. Without `--merge`, the result is copied beside the destination and
+  put in place in one step, so a failed or parallel `get` never leaves a half-filled folder. Have the job write compact results (a summary, a JSON report, the failing test names)
   and fetch those, not gigabytes of logs.
 - Build platform-specific artifacts on the server; never copy macOS binaries there.
 
@@ -193,17 +195,26 @@ Hetzner has no automatic expiry, so `offload` brings its own, in three layers:
   break it, waits for the first run and fails loudly if that run fails. launchd does not see your shell's
   variables, so the token must be in a file of `OFFLOAD_SECRET_FILES` or in an hcloud context. It logs one line per
   run to `<state>/sweeper.log` and shows a macOS notification when it had to delete a server or keeps failing.
-  `offload sweeper status|uninstall` checks or removes it; `create` warns when it is missing.
+  `offload sweeper status|uninstall` checks or removes it; `create` warns when it is missing. A reinstall that fails
+  keeps the previous job running. When the token comes from an hcloud context, the job keeps that context, so
+  switching contexts later does not move it to another project; an expired server in a project it cannot reach is
+  reported as a failure (with a notification), never as "nothing to do". The job uses the Python that installed it,
+  or any Python 3.11+ on its PATH, and refreshes its copy of the script whenever a newer version runs.
 - **Remaining gap:** while the Mac sleeps, is shut down or is offline, nothing deletes anything, so a forgotten
   server bills until the Mac is back (a ccx33 costs about 5 EUR a day). `rm` at the end of every task stays
   mandatory.
-- If `create` or its setup fails, server and key are deleted right away.
+- If `create` or its setup fails, server and key are deleted right away. If Hetzner did not answer the create call
+  in time, the server may exist anyway: then the watchdog stays and deletes it at the expiry.
 - `rm <task>...` deletes server and key, checks that neither is listed any more, and only then stops the watchdog;
   if deleting fails, the watchdog stays as the fallback, the other tasks are still removed, and `rm` exits 1. A
-  task created with another token (another project) is refused rather than forgotten.
+  task whose server the current token cannot see because it lives in another project is refused rather than
+  forgotten; `rm --forget <task>` drops its local key, state and watchdog without asking Hetzner, for a server you
+  know is gone.
 - `ls` shows every offload server in the project with owner, expiry, cost so far, and whether its key is here.
 - `clean` removes servers past their expiry, keys without a server, and local state of vanished servers; it skips
-  tasks another command is working on, so it is safe at any time. `clean --mine` removes every server of this
+  tasks another command is working on (push, put, get, exec, wait and logs hold their task while they run, so `rm`
+  and `clean` never pull a server out from under them; stop a background `wait` before `rm`), so it is safe at any
+  time. `clean --mine` removes every server of this
   session (owner `cc-<session id>` in Claude Code, else `$OFFLOAD_OWNER`, else your login name), `clean --owner
   <owner>` those of another owner, `clean --all` every offload server; use `--all` only when no other agent is
   working.

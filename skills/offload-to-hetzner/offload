@@ -47,7 +47,7 @@ import unicodedata
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 
-VERSION = "1.0.3"
+VERSION = "1.1.0"
 STATE = Path(os.environ.get("OFFLOAD_STATE_DIR", "~/.local/state/offload-to-hetzner")).expanduser()
 _PROJECT = []  # cache for project_id()
 PREFIX = "offload-"
@@ -69,8 +69,15 @@ KEEP = os.environ.get("OFFLOAD_KEEP", "node_modules .venv").split()  # heavy fol
 WAIT_MARGIN = 15 * 60  # wait stops this long before the expiry, so get still has time
 ORPHAN_AGE = 15 * 60  # clean leaves younger keys and state alone, in addition to the per-task lock
 MIN_TTL = 10 * 60  # the watchdog must not fire before the server exists
-GET_MAX_BYTES = int(float(os.environ.get("OFFLOAD_GET_MAX_GB", "20")) * 1e9)  # a server cannot fill the Mac's disk
-GET_MAX_ENTRIES = 1_000_000
+def env_number(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        sys.exit(f"offload: {name}={os.environ[name]!r} is not a number")
+
+
+GET_MAX_BYTES = int(env_number("OFFLOAD_GET_MAX_GB", "20") * 1e9)  # a server cannot fill the Mac's disk
+GET_MAX_ENTRIES = 200_000  # every entry costs memory while the archive streams in, also the skipped ones
 SNAPSHOT_EUR_GB_MONTH = 0.0143  # Hetzner pricing API, 2026-11-09; billed on the compressed size, pro rata
 # dotenv-style files whose values the secret scan blocks; they are also searched for the token (launchd has no shell env)
 SECRET_FILES = [Path(p).expanduser() for p in os.environ.get("OFFLOAD_SECRET_FILES", "").split(":") if p]
@@ -188,12 +195,13 @@ def warn(msg):
     print(f"offload: {msg}", file=sys.stderr, flush=True)
 
 
-def lock(task):
-    """Per-task lock shared by all sessions on this Mac: create, rm, clean and base hold it while they change a task.
-    Returns the open lock file (keep a reference while working) or None when another command holds it."""
+def lock(task, shared=False):
+    """Per-task lock for all agents on this Mac. create, rm, clean and base take it alone (exclusive) while they change
+    a task; push, put, get, exec, wait and logs share it while they work, so rm and clean skip a task in use instead of
+    deleting its server mid-transfer. Returns the open lock file (keep a reference) or None when it is taken."""
     f = open(STATE / f".{task}.lock", "a")
     try:
-        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(f, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
         return f
     except BlockingIOError:
         f.close()
@@ -201,14 +209,26 @@ def lock(task):
 
 
 def lock_or_die(task):
-    return lock(task) or die(f"another offload command is creating or removing {task} right now; try again when it is done")
+    return lock(task) or die(f"another offload command is working on {task} right now (a push, get, exec, wait or logs "
+                             f"counts too); try again when it is done")
 
+
+def use(task):
+    """For the work commands: the task's server, and a shared lock held until the command ends."""
+    global HELD
+    HELD = lock(task, shared=True) or die(f"{task} is being created or removed right now; try again when that is done")
+    return need(task)
+
+
+HELD = None
 
 def hcloud(*args, check=True):
     try:
         r = subprocess.run(["hcloud", *args], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=HCLOUD_TIMEOUT)
     except subprocess.TimeoutExpired:
         r = subprocess.CompletedProcess(["hcloud", *args], 124, "", f"no answer from the Hetzner API within {HCLOUD_TIMEOUT} s")
+    except FileNotFoundError:
+        die("hcloud not found; install it first (brew install hcloud)")
     if check and r.returncode:
         die(f"hcloud {' '.join(args[:2])}: {r.stderr.strip()[:400]}")
     return r
@@ -322,14 +342,6 @@ def remote(task, info, script, *args, **kw):
     return subprocess.run([*ssh_args(task, info), remote_line(script, *args)], **kw)
 
 
-def pipe_to_remote(producer, task, info, script, *args, cwd=None):
-    """producer | ssh server script: returns (producer status, ssh status)."""
-    prod = subprocess.Popen(producer, cwd=cwd, stdout=subprocess.PIPE, env=dict(os.environ, COPYFILE_DISABLE="1"))
-    ssh = subprocess.Popen([*ssh_args(task, info), remote_line(script, *args)], stdin=prod.stdout)
-    prod.stdout.close()  # so the producer gets SIGPIPE if ssh ends early
-    return prod.wait(), ssh.wait()
-
-
 # ---------------------------------------------------------------- secret scan
 
 def shell_value(rest):
@@ -436,7 +448,7 @@ def secret_values(base):
             except ValueError as err:
                 if strict:  # only line number and reason, never the value
                     die(f"{path}, line {number} not readable ({err}). Write it more simply; the file is never executed.")
-                say(f"secret scan: {path.name} line {number} skipped ({err})")
+                add(raw_value(m.group(2)), m.group(1))  # a dotenv loader takes it literally (a URL with & in it ...)
     return found
 
 
@@ -454,41 +466,102 @@ def find_secret(data, values, rx):
     return None
 
 
-def scan(base, files, allow):
-    """Blocks the upload if a file name suggests credentials or data dumps, or a file contains a known secret value or
-    a common token format. Blind to secrets that are neither known here nor in a known format: customer data needs judgment."""
-    values, rx = secret_matchers(base)
-    overlap = max([len(v) for v in values] + [200])
-    hits, allowed, size = [], 0, 0
-    for rel in files:
-        if any(fnmatch.fnmatch(rel, g) for g in allow):
-            allowed += 1
-            continue
-        if SECRET_FILE_RE.search(rel):
-            hits.append(f"{rel}: file name suggests credentials")
-            continue
-        if DATA_FILE_RE.search(rel):
-            hits.append(f"{rel}: database dump or data file (customer data stays on the Mac)")
-            continue
-        path = base / rel
-        if path.is_symlink():
-            continue  # uploaded as a link; the target is not uploaded
-        size += path.stat().st_size
-        with open(path, "rb") as f:
-            tail = b""
-            while chunk := f.read(8 << 20):
-                buf = tail + chunk
-                if why := find_secret(buf, values, rx):
-                    hits.append(f"{rel}: {why}")
-                    break
-                tail = buf[-overlap:]
+class ScanReader:
+    """Hands a file to the archive and scans exactly the bytes that go into it."""
+
+    def __init__(self, f, values, rx, overlap):
+        self.f, self.values, self.rx, self.overlap, self.tail, self.why = f, values, rx, overlap, b"", None
+
+    def read(self, n=-1):
+        data = self.f.read(n)
+        if data and not self.why:
+            buf = self.tail + data
+            self.why = find_secret(buf, self.values, self.rx)
+            self.tail = buf[-self.overlap:]
+        return data
+
+
+def redact(text, values, rx):
+    """A path as it may be printed: known secret values and token formats in it replaced by [REDACTED]."""
+    data = text.encode(errors="surrogateescape")
+    if rx:
+        data = rx.sub(b"[REDACTED]", data)
+    return TOKEN_RE.sub(b"[REDACTED]", data).decode(errors="surrogateescape")
+
+
+def name_hit(rel, values, rx):
+    if SECRET_FILE_RE.search(rel):
+        return "file name suggests credentials"
+    if DATA_FILE_RE.search(rel):
+        return "database dump or data file (customer data stays on the Mac)"
+    if why := find_secret(rel.encode(errors="surrogateescape"), values, rx):
+        return f"the name {why}"
+    return None
+
+
+def report(hits, files, size, values, allowed):
     note = f", {allowed} skipped by --allow" if allowed else ""
-    say(f"secret scan: {len(files)} files, {size / 1e6:.1f} MB, {len(values)} known values + token formats, {len(hits)} hits{note}")
+    say(f"secret scan: {files} files, {size / 1e6:.1f} MB, {len(values)} known values + token formats, {len(hits)} hits{note}")
     if hits:
         for h in hits[:40]:
             print(f"  BLOCKED {h}", file=sys.stderr)
         die("nothing uploaded. Remove these files or values, or pass --allow <path or glob> after checking each one is harmless.")
 
+
+def pack(base, files, allow, dirs=()):
+    """Builds the upload as a .tar.gz on this Mac from exactly the bytes the scan saw, so a file changed afterwards
+    cannot slip through, and blocks it when a name suggests credentials or data dumps, or a name, a link target or
+    content holds a known secret value or a common token format. Blind to secrets that are neither known here nor in a
+    known format: customer data needs judgment. Returns the archive's path; the caller deletes it."""
+    values, rx = secret_matchers(base)
+    overlap = max([len(v) for v in values] + [200])
+    hits, allowed, size = [], 0, 0
+    fd, out = tempfile.mkstemp(prefix="upload-", suffix=".tgz", dir=STATE)
+    os.close(fd)
+    try:
+        with tarfile.open(out, "w:gz", compresslevel=6) as tf:
+            for rel in dirs:
+                if not any(fnmatch.fnmatch(rel, g) for g in allow) and (why := name_hit(rel, values, rx)):
+                    hits.append(f"{redact(rel, values, rx)}/: {why}")
+                    continue
+                tf.add(base / rel, arcname=rel, recursive=False)
+            for rel in files:
+                check = not any(fnmatch.fnmatch(rel, g) for g in allow)
+                allowed += not check
+                if check and (why := name_hit(rel, values, rx)):
+                    hits.append(f"{redact(rel, values, rx)}: {why}")
+                    continue
+                tf.inodes.clear()  # each path as itself: a second name of the same file must not become a hard-link entry
+                info = tf.gettarinfo(str(base / rel), arcname=rel)  # a link stays a link; its target stays home
+                if info.issym():
+                    if check and (why := find_secret(info.linkname.encode(errors="surrogateescape"), values, rx)):
+                        hits.append(f"{redact(rel, values, rx)}: the link target {why}")
+                        continue
+                    tf.addfile(info)
+                elif info.isreg():
+                    size += info.size
+                    with open(base / rel, "rb") as f:
+                        reader = ScanReader(f, values, rx, overlap) if check else f
+                        try:
+                            tf.addfile(info, reader)
+                        except OSError:
+                            die(f"{redact(rel, values, rx)} changed while it was packed; nothing uploaded, try again")
+                    if check and reader.why:
+                        hits.append(f"{redact(rel, values, rx)}: {reader.why}")
+    except BaseException:
+        os.unlink(out)
+        raise
+    if hits:
+        os.unlink(out)
+    report(hits, len(files), size, values, allowed)
+    return out
+
+
+def scan_blob(base, rel, data):
+    """The same checks for one piece of data that goes out as it is (a setup script)."""
+    values, rx = secret_matchers(base)
+    why = name_hit(rel, values, rx) or find_secret(data, values, rx)
+    report([f"{redact(rel, values, rx)}: {why}"] if why else [], 1, len(data), values, 0)
 
 def check_outgoing(*texts):
     """Every string that goes to the server outside a scanned file: commands, --cwd, remote paths."""
@@ -551,6 +624,8 @@ def cmd_watchdog(argv):
                 note(f"{kind} list not readable: {LAST_ERROR}")
             time.sleep(5 if found else 60)
     note(f"watchdog done: server and key of run {run} are gone")
+    with contextlib.suppress(OSError):  # tells clean and the sweeper that this run needs nothing more
+        (log.parent / f"gone-{run}").touch()
 
 
 def stop_watchdog(info):
@@ -577,10 +652,19 @@ def ensure_firewall():
         return
     rules = [{"direction": "in", "protocol": "tcp", "port": "22", "source_ips": ["0.0.0.0/0", "::/0"], "description": "ssh"},
              {"direction": "in", "protocol": "icmp", "source_ips": ["0.0.0.0/0", "::/0"], "description": "ping"}]
-    r = subprocess.run(["hcloud", "firewall", "create", "--name", FIREWALL, "--label", MANAGED, "--rules-file", "-"],
-                       input=json.dumps(rules), capture_output=True, text=True)
-    if r.returncode and hcloud("firewall", "describe", FIREWALL, check=False).returncode:  # a parallel create may have won
-        die(f"firewall {FIREWALL} not created: {r.stderr.strip()[:300]}")
+    try:
+        r = subprocess.run(["hcloud", "firewall", "create", "--name", FIREWALL, "--label", MANAGED, "--rules-file", "-"],
+                           input=json.dumps(rules), capture_output=True, text=True, timeout=HCLOUD_TIMEOUT)
+        err = r.stderr.strip()[:300] if r.returncode else ""
+    except subprocess.TimeoutExpired:
+        err = f"no answer from the Hetzner API within {HCLOUD_TIMEOUT} s"
+    # Whoever made it (this call, or a parallel create that won), only offload's own SSH-only firewall is used.
+    r = hcloud("firewall", "describe", FIREWALL, "-o", "json", check=False)
+    if r.returncode:
+        die(f"firewall {FIREWALL} not created: {err or r.stderr.strip()[:300]}")
+    if not firewall_ok(json.loads(r.stdout or "{}")):
+        die(f"the firewall {FIREWALL} is not the one offload creates (label {MANAGED}, inbound only tcp/22 and icmp); "
+            f"nothing created")
 
 
 def hourly_price(server_type, location):
@@ -622,8 +706,9 @@ def run_setup(task, info, what):
         path = Path(what).expanduser().resolve()  # a link is scanned and sent as its target
         if not path.is_file():
             die(f"setup script {what} not found")
-        scan(path.parent, [path.name], [])
-        script = path.read_text()
+        data = path.read_bytes()  # read once: the scanned bytes are the ones that run
+        scan_blob(path.parent, path.name, data)
+        script = data.decode(errors="replace")
     say(f"setup: {what}")
     # cat takes the whole script first, so commands in it cannot swallow the rest of it from stdin
     r = remote(task, info, "cat > /root/.offload-setup.sh && bash /root/.offload-setup.sh < /dev/null", input=script, text=True)
@@ -637,6 +722,7 @@ def cmd_create(a):
     if not MIN_TTL <= ttl <= 24 * 3600:
         die("--ttl must be between 10m and 24h")
     held = lock_or_die(task)  # returned to the caller, which may keep holding it (base create)
+    shutil.which("ssh-keygen") or die("ssh-keygen not found (it comes with macOS)")
     if not sweeper_installed():
         warn("the sweeper is not installed (`offload sweeper install`): after a reboot or crash nothing would delete this server")
     if name in {s["name"] for s in hjson("server", "list") or []}:
@@ -674,9 +760,11 @@ def cmd_create(a):
         die(f"the watchdog did not start (see {d / 'watchdog.log'}); nothing created at Hetzner")
     labels = [MANAGED, f"offload-run={info['run']}", f"offload-task={task}", f"offload-owner={info['owner']}", f"offload-expires={info['expires']}"]
     flags = [x for label in labels for x in ("--label", label)]
+    maybe_created = False
     try:
         ensure_firewall()
-        info["project"] = project_id()
+        info["project"] = project_id() or die("could not tell which Hetzner project this token belongs to (offload's "
+                                              "firewall is not readable); nothing created")
         write_info(task, info)
         keyname = f"{name}-{info['run']}"
         hcloud("ssh-key", "create", "--name", keyname, "--public-key-from-file", str(d / "key.pub"), *flags[:6])
@@ -685,6 +773,9 @@ def cmd_create(a):
             r = hcloud("server", "create", "--name", name, "--type", a.type, "--image", image, "--location", loc, "--ssh-key", keyname,
                        "--firewall", FIREWALL, "--user-data-from-file", str(d / "user-data"), "--without-ipv6",  # one primary IP
                        *flags, "-o", "json", check=False)                                      # per server, not two
+            if r.returncode == 124:  # no answer in time: Hetzner may have made the server all the same
+                maybe_created = True
+                die(f"server create: {r.stderr.strip()}")
             if r.returncode == 0:
                 break
             err = r.stderr.strip()
@@ -707,8 +798,12 @@ def cmd_create(a):
         say(f"ready: offload push {task} . | offload exec {task} -- '<command>' | offload rm {task}")
         return held
     except BaseException:
-        warn("create or setup failed, deleting server and key right away")
-        remove_run(task, info["run"])
+        if maybe_created:
+            warn(f"Hetzner did not answer in time, so the server may exist anyway. Its watchdog stays and deletes it at "
+                 f"{clock(info['expires'])}; `offload rm {task}` removes it sooner once Hetzner answers again.")
+        else:
+            warn("create or setup failed, deleting server and key right away")
+            remove_run(task, info["run"])
         raise
 
 
@@ -729,12 +824,18 @@ def remove_run(task, run):
     if the deletion fails, the watchdog stays as the fallback. Returns False when something is left; the caller holds
     the task lock."""
     mine = read_info(task)
-    if mine and mine.get("run") == run and mine.get("project") and project_id() != mine["project"]:
-        # Lists of another project are empty for this run: removing its local key and watchdog would leave it billing.
-        warn(f"{task} was created in another Hetzner project (its firewall {FIREWALL} has another ID, or the current token "
-             f"cannot see it). Use a token of that project to remove it; nothing changed.")
-        return False
     sel = f"offload-run={run}"
+    if mine and mine.get("run") == run and mine.get("project") and project_id() != mine["project"]:
+        # Another project's lists are empty for this run, which proves nothing: removing the local key and watchdog would
+        # leave the server billing. When the current token does see the run's server or key, it is this project after all
+        # (a new token, or offload's firewall was deleted and made again): go on, and remember the new ID.
+        if not (listing("server", sel) or listing("ssh-key", sel)):
+            warn(f"{task} was created in another Hetzner project: the current token cannot see its server or key. Remove it "
+                 f"with a token of that project. If you know it is gone already, `offload rm --forget {task}` drops the "
+                 f"local key and watchdog. Nothing changed.")
+            return False
+        mine["project"] = project_id()
+        write_info(task, mine)
     if not delete_all("server", sel, 4):
         warn(f"ATTENTION: the server of {task} (run {run}) is not deleted or the list is not readable. It keeps billing; "
              f"the watchdog stays active. Retry `offload rm {task}`.")
@@ -762,10 +863,18 @@ def cmd_rm(a):
         task = task_name(text)
         held = lock(task)
         if not held:
-            warn(f"{task}: skipped, another offload command is creating or removing it right now")
+            warn(f"{task}: skipped, another offload command is working on it right now (a push, get, exec, wait or logs "
+                 f"counts too); try again when it is done")
             ok = False
             continue
         info = read_info(task)
+        if a.forget:  # only for a server that is known to be gone: Hetzner is not asked
+            if info:
+                stop_watchdog(info)
+            shutil.rmtree(state_dir(task), ignore_errors=True)
+            say(f"{task}: local key, state and watchdog dropped without asking Hetzner")
+            held.close()
+            continue
         runs = {info["run"]} if info and info.get("run") else set()
         keys, rows = listing("ssh-key", f"offload-task={task}"), listing("server", f"offload-task={task}")
         if keys is None or rows is None:
@@ -850,12 +959,13 @@ def clean(everything=False, who=None, grace=0):
         info = read_info(d.name)
         if not (d.is_dir() and info) or key_runs is None or info.get("run") in live | key_runs or now - info.get("created", 0) < ORPHAN_AGE:
             continue
-        if info.get("project") and project_id() != info["project"]:  # another project: empty lists here prove nothing
+        gone = (d / f"gone-{info.get('run')}").exists()  # its own watchdog saw server and key deleted, with the right token
+        if not gone and info.get("project") and project_id() != info["project"]:  # another project: empty lists prove nothing
             continue
         held = lock(d.name)
         if held:
             sel = f"offload-run={info.get('run')}"
-            if read_info(d.name) == info and listing("server", sel) == [] and listing("ssh-key", sel) == []:  # re-checked under the lock
+            if read_info(d.name) == info and (gone or (listing("server", sel) == [] and listing("ssh-key", sel) == [])):
                 stop_watchdog(info)
                 shutil.rmtree(d, ignore_errors=True)
                 say(f"local state of {d.name} removed (its server and key no longer exist)")
@@ -887,24 +997,34 @@ def token_from_files():
             lines = path.read_text(errors="ignore").splitlines()
         except OSError:
             continue
-        for line in lines:
+        found = None
+        for line in lines:  # like `source`, the last usable assignment in a file wins
             if m := re.match(rf"\s*(?:export\s+)?{re.escape(TOKEN_VAR)}\s*=(.*)", line):
                 try:
-                    return shell_value(m.group(1)) or None
+                    found = shell_value(m.group(1)) or found  # empty, or a $REFERENCE whose value is unknown: keep looking
                 except ValueError:
-                    return None
+                    continue
+        if found:
+            return found
     return None
+
+
+def hcloud_config():
+    try:
+        import tomllib
+        return tomllib.loads(Path(os.environ.get("HCLOUD_CONFIG", "~/.config/hcloud/cli.toml")).expanduser().read_text())
+    except (ImportError, OSError, ValueError):
+        return {}
+
+
+def active_context():
+    return os.environ.get("HCLOUD_CONTEXT") or hcloud_config().get("active_context")
 
 
 def token_from_context():
     """The token of hcloud's active context (`hcloud context create`), as hcloud itself would pick it."""
-    try:
-        import tomllib
-        data = tomllib.loads(Path(os.environ.get("HCLOUD_CONFIG", "~/.config/hcloud/cli.toml")).expanduser().read_text())
-    except (ImportError, OSError, ValueError):
-        return None
-    active = os.environ.get("HCLOUD_CONTEXT") or data.get("active_context")
-    return next((c.get("token") for c in data.get("contexts", []) if c.get("name") == active and c.get("token")), None)
+    active = active_context()
+    return next((c.get("token") for c in hcloud_config().get("contexts", []) if c.get("name") == active and c.get("token")), None)
 
 
 def resolve_token():
@@ -922,7 +1042,9 @@ def project_id():
     ID; None when the firewall is missing or the API does not answer."""
     if not _PROJECT:
         r = hcloud("firewall", "describe", FIREWALL, "-o", "json", check=False)
-        _PROJECT.append(str(json.loads(r.stdout)["id"]) if r.returncode == 0 and r.stdout.strip() else None)
+        if r.returncode or not r.stdout.strip():
+            return None  # not cached: the firewall may exist a moment later (create makes it)
+        _PROJECT.append(str(json.loads(r.stdout)["id"]))
     return _PROJECT[0]
 
 
@@ -997,6 +1119,12 @@ def cmd_sweep(a):
                 ok, removed = clean(grace=SWEEP_GRACE)
                 rows = servers()
                 left = [s["name"] for s in rows if expiry(s) <= time.time() - SWEEP_GRACE]
+                for d in STATE.iterdir():  # expired runs of another project: this token cannot delete them, so say so
+                    info = read_info(d.name) if d.is_dir() else None
+                    if (info and info.get("expires", 0) <= time.time() - SWEEP_GRACE and info.get("project")
+                            and info["project"] != project_id() and not (d / f"gone-{info.get('run')}").exists()
+                            and not watchdog_alive(info)):
+                        left.append(f"{PREFIX}{d.name} (another Hetzner project, not reachable with the sweeper's token)")
                 seen = len(rows)
         except SystemExit:  # die() inside: a list not readable, hcloud missing ...
             ok = False
@@ -1028,6 +1156,17 @@ def cmd_sweep(a):
     sys.exit(0 if ok else 1)
 
 
+# The Python that installed the sweeper first, then any 3.11+ on the PATH: survives Homebrew moving to a new Python
+# version, and never falls back to macOS's old system Python.
+PICK_PYTHON = r"""for p in "$0" python3 python3.14 python3.13 python3.12 python3.11; do
+  command -v "$p" >/dev/null 2>&1 && "$p" -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null &&
+    exec "$p" -I "$1" sweep
+done
+echo "offload sweeper: no Python 3.11 or newer found" >&2
+osascript -e 'display notification "No Python 3.11 or newer found: expired servers are not cleaned up" with title "offload sweeper"'
+exit 1"""
+
+
 def sweeper_plist():
     """Made on this Mac at install time: its Python, its hcloud, its state folder. Names of settings, never the token."""
     py = shutil.which("python3") or sys.executable
@@ -1040,10 +1179,11 @@ def sweeper_plist():
     for name in ("HCLOUD_CONFIG", "HCLOUD_CONTEXT"):
         if os.environ.get(name):
             env[name] = os.environ[name]
+    if "HCLOUD_CONTEXT" not in env and not token_from_files() and active_context():
+        env["HCLOUD_CONTEXT"] = active_context()  # pinned: switching contexts later must not move the sweeper elsewhere
     return {
         "Label": SWEEPER_LABEL,
-        # env python3 on the PATH above: the job keeps working when Homebrew moves to a new Python version
-        "ProgramArguments": ["/usr/bin/env", "python3", "-I", str(SWEEPER_BIN), "sweep"],
+        "ProgramArguments": ["/bin/sh", "-c", PICK_PYTHON, sys.executable, str(SWEEPER_BIN)],
         "EnvironmentVariables": env,
         "RunAtLoad": True,
         # Calendar ticks, not StartInterval: launchd runs a calendar tick missed during sleep once on wake, but drops
@@ -1058,17 +1198,20 @@ def sweeper_plist():
 def cmd_sweeper(a):
     """Installs, removes or shows the launchd job that runs `offload sweep`; install and uninstall are idempotent."""
     domain = f"gui/{os.getuid()}"
+    previous = SWEEPER_PLIST.read_bytes() if SWEEPER_PLIST.exists() else None
+    if a.action == "install":  # everything that can fail comes first, so a failed reinstall keeps the old job running
+        if not (token_from_files() or token_from_context()):
+            die(f"the sweeper runs without your shell's environment, so it cannot see ${TOKEN_VAR} there. Put the token "
+                f"into a file listed in OFFLOAD_SECRET_FILES (a line {TOKEN_VAR}=...), or into an hcloud context "
+                f"(`hcloud context create <name>`), then install again. Nothing changed.")
+        new_plist = plistlib.dumps(sweeper_plist())
+        install_bin()
     if a.action in ("install", "uninstall"):
         subprocess.run(["launchctl", "bootout", f"{domain}/{SWEEPER_LABEL}"], capture_output=True)
         SWEEPER_PLIST.unlink(missing_ok=True)
     if a.action == "install":
-        if not (token_from_files() or token_from_context()):
-            die(f"the sweeper runs without your shell's environment, so it cannot see ${TOKEN_VAR} there. Put the token "
-                f"into a file listed in OFFLOAD_SECRET_FILES (a line {TOKEN_VAR}=...), or into an hcloud context "
-                f"(`hcloud context create <name>`), then install again. Nothing installed.")
-        install_bin()
         SWEEPER_PLIST.parent.mkdir(parents=True, exist_ok=True)
-        SWEEPER_PLIST.write_bytes(plistlib.dumps(sweeper_plist()))
+        SWEEPER_PLIST.write_bytes(new_plist)
         log = STATE / "sweeper.log"
 
         def stamp():  # inode and size: the first run may rotate the log, which makes a new, shorter file
@@ -1085,7 +1228,10 @@ def cmd_sweeper(a):
                 break
             time.sleep(1)
         else:
-            die(f"launchctl bootstrap failed: {r.stderr.strip()}")
+            if previous:
+                SWEEPER_PLIST.write_bytes(previous)
+                subprocess.run(["launchctl", "bootstrap", domain, str(SWEEPER_PLIST)], capture_output=True)
+            die(f"launchctl bootstrap failed: {r.stderr.strip()}" + ("; the previous job is running again" if previous else ""))
         for _ in range(60):  # RunAtLoad starts one round right away: wait for its log line to prove the job really works
             if stamp() not in (None, before):
                 break
@@ -1149,7 +1295,7 @@ SAFE_PUSH_DIR = re.compile(r"/(root|srv|opt|tmp|mnt|home/[a-z_][a-z0-9_-]*)(/[A-
 
 def cmd_push(a):
     task = task_name(a.task)
-    info = need(task)
+    info = use(task)
     local = Path(a.local).resolve()
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", unicodedata.normalize("NFKD", local.name).encode("ascii", "ignore").decode()).strip(".-")
     remote_dir = a.remote or f"/root/work/{slug or 'project'}"  # a folder called "My Project" goes to /root/work/My-Project
@@ -1166,46 +1312,47 @@ def cmd_push(a):
             files.append(rel)
         elif p.is_dir():
             skipped.append(rel)  # submodules and nested repositories
-    scan(local, files, a.allow)
     if skipped:
         say(f"not pushed (submodules or nested repositories): {', '.join(skipped[:10])}")
-    with tempfile.NamedTemporaryFile("wb", delete=False, dir=state_dir(task)) as lst:
-        lst.write(b"\0".join(os.fsencode(f) for f in files))
+    archive = pack(local, files, a.allow)
     try:
-        tar_rc, ssh_rc = pipe_to_remote(["tar", "-czf", "-", "--no-recursion", "--null", "-T", lst.name], task, info, PUSH, remote_dir, *KEEP, cwd=local)
+        with open(archive, "rb") as f:
+            r = remote(task, info, PUSH, remote_dir, *KEEP, stdin=f)
     finally:
-        os.unlink(lst.name)
-    if tar_rc or ssh_rc:
-        die(f"push failed (tar {tar_rc}, ssh {ssh_rc}); the remote folder may be the old or the new tree, push again")
+        os.unlink(archive)
+    if r.returncode:
+        die(f"push failed (ssh {r.returncode}); the remote folder may be the old or the new tree, push again")
 
 
 def cmd_put(a):
     task = task_name(a.task)
-    info = need(task)
+    info = use(task)
     check_outgoing(a.remote)
     src = Path(a.local).expanduser()
     if src.is_file():
         src = src.resolve()  # a link is scanned and sent as its target
-        scan(src.parent, [src.name], a.allow)
-        with open(src, "rb") as f:
-            r = remote(task, info, 'mkdir -p "$(dirname "$1")" && cat > "$1" && chmod "$2" "$1"', a.remote, oct(src.stat().st_mode & 0o777)[2:], stdin=f)
+        archive = pack(src.parent, [src.name], a.allow)
+        try:
+            with open(archive, "rb") as f:  # unpacked beside the target, then moved into place with its mode
+                r = remote(task, info, 'set -e; mkdir -p "$(dirname "$1")"; d=$(mktemp -d "$(dirname "$1")/.offload-put.XXXXXX"); '
+                           'trap \'rm -rf "$d"\' EXIT; tar -xzf - -C "$d" --no-same-owner --warning=no-unknown-keyword '
+                           '--warning=no-timestamp; mv -f -- "$d/$2" "$1"', a.remote, src.name, stdin=f)
+        finally:
+            os.unlink(archive)
         if r.returncode:
             die(f"put failed (exit {r.returncode})")
     elif src.is_dir():
         files = sorted(str(p.relative_to(src)) for p in src.rglob("*") if p.is_file() or p.is_symlink())
         dirs = sorted(str(p.relative_to(src)) for p in src.rglob("*") if p.is_dir() and not p.is_symlink())
-        scan(src.resolve(), files, a.allow)
-        # Exactly the scanned list goes out (plus the folders, empty ones included): a file that appears later is not sent.
-        with tempfile.NamedTemporaryFile("wb", delete=False, dir=state_dir(task)) as lst:
-            lst.write(b"\0".join(os.fsencode(f) for f in dirs + files))
+        archive = pack(src.resolve(), files, a.allow, dirs=dirs)  # the folders too, empty ones included
         try:
-            rcs = pipe_to_remote(["tar", "-czf", "-", "--no-recursion", "--null", "-T", lst.name], task, info,
-                                 'mkdir -p "$1" && tar -xzf - -C "$1" --no-same-owner --warning=no-unknown-keyword --warning=no-timestamp',
-                                 a.remote, cwd=src)
+            with open(archive, "rb") as f:
+                r = remote(task, info, 'mkdir -p "$1" && tar -xzf - -C "$1" --no-same-owner --warning=no-unknown-keyword '
+                           '--warning=no-timestamp', a.remote, stdin=f)
         finally:
-            os.unlink(lst.name)
-        if any(rcs):
-            die(f"put failed (tar {rcs[0]}, ssh {rcs[1]})")
+            os.unlink(archive)
+        if r.returncode:
+            die(f"put failed (ssh {r.returncode})")
     else:
         die(f"{src} not found")
     say(f"put {src} -> {a.remote}")
@@ -1256,7 +1403,7 @@ def check_get_target(src, dest):
 
 def cmd_get(a):
     task = task_name(a.task)
-    info = need(task)
+    info = use(task)
     check_outgoing(a.remote)
     expected = PurePosixPath(a.remote.rstrip("/")).name  # the only top-level name accepted from the server
     if expected in ("", ".", ".."):
@@ -1287,14 +1434,14 @@ def cmd_get(a):
                             f".gitmodules, .lfsconfig ...) and names with invisible characters are always refused, other "
                             f"hidden files only with --hidden; nothing copied")
                     entries += 1  # every entry counts, also the skipped ones: their metadata costs memory too
-                    if not (member.isfile() or member.isdir()):
+                    if not (member.isfile() or member.isdir()) or member.issparse():  # sparse: declared size and writes can differ
                         skipped += 1
                     else:
                         total += member.size
                     if total > GET_MAX_BYTES or entries > GET_MAX_ENTRIES:
                         proc.kill()
                         die(f"get {a.remote}: more than {GET_MAX_BYTES / 1e9:.0f} GB or {GET_MAX_ENTRIES} entries; nothing copied (OFFLOAD_GET_MAX_GB raises the size limit)")
-                    if not (member.isfile() or member.isdir()):
+                    if not (member.isfile() or member.isdir()) or member.issparse():
                         continue
                     try:
                         archive.extract(member, stage, filter="data")
@@ -1354,13 +1501,42 @@ def cmd_get(a):
                 if probe.is_symlink():
                     die(f"{probe} is a symlink; get does not write through links. Nothing copied.")
         check_get_target(src, dest)
-        if src.is_dir():
-            shutil.copytree(src, dest, dirs_exist_ok=True)
-            count = sum(1 for p in src.rglob("*") if p.is_file())
+        count = sum(1 for p in src.rglob("*") if p.is_file()) if src.is_dir() else 1
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if a.merge:  # merging on purpose: into what is there, file by file
+            if src.is_dir():
+                shutil.copytree(src, dest, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src, dest)
         else:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dest)
-            count = 1
+            # Copied beside the destination, then put in place in one step: no half tree when something fails, and a
+            # destination that another get filled meanwhile is never written into.
+            tmp = dest.parent / f".{dest.name}.offload-get-{os.getpid()}"
+            try:
+                if src.is_dir():
+                    shutil.copytree(src, tmp)
+                    try:
+                        os.rename(tmp, dest)  # takes the place of a missing or empty folder only
+                    except OSError:
+                        die(f"{dest} was filled meanwhile; nothing copied")
+                else:
+                    shutil.copy2(src, tmp)
+                    try:
+                        os.link(tmp, dest)  # fails when something appeared there meanwhile
+                    except FileExistsError:
+                        die(f"{dest} appeared meanwhile; nothing copied")
+                    except OSError:  # no hard links on this file system (exFAT ...): create it exclusively instead
+                        try:
+                            with open(tmp, "rb") as fi, open(dest, "xb") as fo:
+                                shutil.copyfileobj(fi, fo)
+                        except FileExistsError:
+                            die(f"{dest} appeared meanwhile; nothing copied")
+                        shutil.copystat(tmp, dest)
+            finally:
+                if tmp.is_dir() and not tmp.is_symlink():
+                    shutil.rmtree(tmp, ignore_errors=True)
+                else:
+                    tmp.unlink(missing_ok=True)
         say(f"got {count} files into {dest}" + (f" ({skipped} links or special entries skipped)" if skipped else ""))
     finally:
         shutil.rmtree(stage, ignore_errors=True)
@@ -1368,7 +1544,7 @@ def cmd_get(a):
 
 def cmd_exec(a):
     task = task_name(a.task)
-    info = need(task)
+    info = use(task)
     command = " ".join(a.command).strip()
     if not command:
         die("no command given; put it after --, as one single-quoted string")
@@ -1390,7 +1566,7 @@ def show_tail(task, info, job, n):
 
 def cmd_wait(a):
     task, job = task_name(a.task), job_name(a.job)
-    info = need(task)
+    info = use(task)
     start = time.time()
     # 15 minutes before the expiry, so get still has time; less on a short-lived server (a 10m server gets 2.5 minutes)
     deadline = info["expires"] - min(WAIT_MARGIN, (info["expires"] - info["created"]) // 4)
@@ -1427,7 +1603,7 @@ def cmd_wait(a):
 
 def cmd_logs(a):
     task, job = task_name(a.task), job_name(a.job)
-    info = need(task)
+    info = use(task)
     if a.follow:
         r = remote(task, info, 'tail -n "$2" -f --pid="$(cut -d" " -f1 "$1.pid")" "$1.log"', f"{JOBS}/{job}", str(a.n))
     else:
@@ -1566,6 +1742,7 @@ def main():
     sub.add_parser("ls")
     s = sub.add_parser("rm")
     s.add_argument("tasks", nargs="+")
+    s.add_argument("--forget", action="store_true", help="drop local key, state and watchdog without asking Hetzner")
     s = sub.add_parser("clean")
     g = s.add_mutually_exclusive_group()
     g.add_argument("--mine", action="store_true")

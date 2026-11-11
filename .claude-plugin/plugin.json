@@ -1,6 +1,6 @@
 {
   "name": "offload-to-hetzner",
-  "version": "1.0.3",
+  "version": "1.1.0",
   "description": "Offload heavy builds, Docker, test suites and parallel agent work from your Mac to short-lived Hetzner Cloud servers, with watchdog, launchd sweeper and secret scan. A Hetzner alternative to Vercel's offload-to-sandbox.",
   "author": {
     "name": "pipamann",
