@@ -9,7 +9,7 @@ description: >
   to Vercel's offload-to-sandbox: every server gets its own SSH key, labels, an expiry and a watchdog, and a cx53
   (16 cores, 32 GB) costs about 0.05 EUR per hour.
 metadata:
-  version: "1.0.2"
+  version: "1.0.3"
   homepage: https://github.com/pipamann/offload-to-hetzner
 ---
 
@@ -81,8 +81,8 @@ owner and purpose so parallel agents never collide, and never use another agent'
 ## Sizing and prices
 
 Hetzner bills every started hour, even for a five-minute server, and keeps billing a server that is powered off
-until it is deleted. `$O types` prints the live prices of every type on sale. Prices on 2026-11-09 in fsn1, without
-VAT:
+until it is deleted. `$O types` prints the live price of every type on sale at its cheapest EU location. Prices on
+2026-11-11, without VAT (Helsinki has been 15 % cheaper for the ccx and cpx lines since 2026-11-10):
 
 | Type | Cores | RAM | EUR/h | Use |
 |---|---|---|---|---|
@@ -90,8 +90,8 @@ VAT:
 | cx33 | 4 shared | 8 GB | 0.0136 | one container stack |
 | cx43 | 8 shared | 16 GB | 0.0256 | mid-size builds |
 | cx53 | 16 shared | 32 GB | 0.0473 | **default**: most cores per euro, for builds, suites and Docker |
-| ccx33 | 8 dedicated | 32 GB | 0.2219 | steady timing (benchmarks, timing-sensitive tests) |
-| ccx43 | 16 dedicated | 64 GB | 0.4423 | steady timing with lots of RAM |
+| ccx33 | 8 dedicated | 32 GB | 0.1883 in hel1 (0.2219 in fsn1/nbg1) | steady timing (benchmarks, timing-sensitive tests) |
+| ccx43 | 16 dedicated | 64 GB | 0.3758 in hel1 (0.4423 in fsn1/nbg1) | steady timing with lots of RAM |
 | cax41 | 16 Arm | 32 GB | 0.0657 | only for Arm builds |
 
 - Shared cores can be slowed by neighbours; dedicated cores are not. For throughput, cx53 beats ccx33 at a fifth of
@@ -101,7 +101,9 @@ VAT:
   limit, `create` says so; ask the user to request more in the Hetzner Console (Limits, "Request limit increase").
 - Offload servers get an IPv4 address only (`--without-ipv6`), so each one uses one primary IP instead of two. SSH,
   apt, GitHub, Docker Hub, PyPI and npm all work over IPv4.
-- Without `--location`, `create` tries fsn1, then nbg1, then hel1 when a type is sold out.
+- Without `--location`, `create` takes the cheapest of fsn1, nbg1 and hel1 for the type (equal prices in that order;
+  `OFFLOAD_LOCATIONS` changes the list), and tries the next one when the type is sold out. Helsinki adds about 20 ms
+  to SSH round trips from Central Europe, which does not matter for builds.
 - Memory: a build killed with exit status 137 was usually killed by the out-of-memory killer. Take a type with
   more RAM or lower the build's parallelism instead of retrying.
 
@@ -238,6 +240,7 @@ branch on the same server.
 | `OFFLOAD_SECRET_FILES` | (none) | colon-separated dotenv files: their values are blocked from uploads, and the token is looked up there |
 | `OFFLOAD_STATE_DIR` | `~/.local/state/offload-to-hetzner` | keys, logs, watchdog and sweeper state |
 | `OFFLOAD_TYPE` | `cx53` | default server type for `create` |
+| `OFFLOAD_LOCATIONS` | `fsn1 nbg1 hel1` | locations `create` may use, cheapest first |
 | `OFFLOAD_KEEP` | `node_modules .venv` | folders `push` keeps on the server |
 | `OFFLOAD_GET_MAX_GB` | `20` | size limit for `get` |
 | `OFFLOAD_OWNER` | session or login name | owner label, used by `clean --mine` |

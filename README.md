@@ -26,13 +26,13 @@ same workflow to [Hetzner Cloud](https://www.hetzner.com/cloud/). It is an indep
 with Vercel or Hetzner, and shares no code with Vercel's skill.
 
 The trade-off, with prices from the providers' pricing pages and API (Vercel Pro, `iad1`, September 2026;
-Hetzner, `fsn1`, November 2026, without VAT):
+Hetzner API, November 2026, without VAT):
 
 | | Vercel Sandbox (Pro) | Hetzner `ccx33` | Hetzner `cx53` |
 |---|---|---|---|
 | Size | 8 vCPU, 16 GB (Pro maximum) | 8 dedicated vCPU, 32 GB | 16 shared vCPU, 32 GB |
-| Per hour, CPU fully busy | about 1.36 USD | 0.22 EUR | 0.05 EUR |
-| Per hour, agent mostly waiting (10 % CPU) | about 0.44 USD | 0.22 EUR | 0.05 EUR |
+| Per hour, CPU fully busy | about 1.36 USD | 0.19 EUR in Helsinki (0.22 in Germany) | 0.05 EUR |
+| Per hour, agent mostly waiting (10 % CPU) | about 0.44 USD | 0.19 EUR in Helsinki | 0.05 EUR |
 | Billing | active CPU per ms + memory | per started hour | per started hour |
 | Start | seconds | about 1 minute (+2 min for Docker, or a snapshot) | same |
 | Expiry | built in | **none at Hetzner**: this skill adds watchdog + sweeper | same |
