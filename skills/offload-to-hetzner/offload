@@ -47,7 +47,7 @@ import unicodedata
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 STATE = Path(os.environ.get("OFFLOAD_STATE_DIR", "~/.local/state/offload-to-hetzner")).expanduser()
 _PROJECT = []  # cache for project_id()
 PREFIX = "offload-"
@@ -1305,23 +1305,43 @@ def cmd_get(a):
         src = items[0]
         for p in [src, *src.rglob("*")]:  # results are data: no execute bits from the server
             os.chmod(p, 0o755 if p.is_dir() else 0o644)
+        # Where code on the Mac starts by itself, or everything else lives: never a target, not even with --merge.
+        home = Path(os.path.realpath(Path.home()))
+        no_go = [home / "Library", home / "Applications", Path("/Library"), Path("/System"), Path("/Applications")]
+        if dest == home or dest in home.parents or any(dest == p or p in dest.parents for p in no_go):
+            die(f"{dest}: get does not write into the home folder itself, the folders above it, or a Library or "
+                f"Applications folder. Pick a results folder, for example ./offload-results. Nothing copied.")
+
+        def occupied(p):
+            return p.is_file() or (p.is_dir() and any(p.iterdir()))
+
+        # Without --merge, nothing that exists here is merged into or replaced: what the server sends lands in a new or
+        # empty place (like cp -r, an existing folder receives a folder result as a subfolder of its own name).
         if src.is_dir():
             if dest.exists() and not dest.is_dir():
                 die(f"{dest} is a file and the server sent a folder; nothing copied")
+            if occupied(dest) and not a.merge:
+                dest = dest / src.name
+                if dest.is_symlink() or occupied(dest):
+                    die(f"{dest} already exists; get does not merge into existing files unless you pass --merge. Nothing copied.")
             parts = [p.relative_to(src) for p in src.rglob("*")]
         else:
-            if dest.is_dir():  # dest itself is no link (checked above), so this stays where the user pointed
+            if dest.is_dir() and not dest.is_symlink():
                 dest = dest / src.name
+            if dest.is_dir() and not dest.is_symlink():
+                die(f"{dest} is a folder and the server sent a file; nothing copied")
+            if (dest.exists() or dest.is_symlink()) and not a.merge:
+                die(f"{dest} already exists; get replaces files only with --merge. Nothing copied.")
             parts = []
         # Never write through a link that already exists here: the server could aim it at any file on the Mac.
-        for rel in [Path(".")] + parts:
+        if dest.is_symlink():
+            die(f"{dest} is a symlink; get does not write through links. Nothing copied.")
+        for rel in parts:
             probe = dest
             for part in rel.parts:
                 probe = probe / part
                 if probe.is_symlink():
                     die(f"{probe} is a symlink; get does not write through links. Nothing copied.")
-        if dest.is_symlink() and src.is_file():
-            die(f"{dest} is a symlink; get does not write through links. Nothing copied.")
         check_get_target(src, dest)
         if src.is_dir():
             shutil.copytree(src, dest, dirs_exist_ok=True)
@@ -1517,6 +1537,7 @@ def main():
     s.add_argument("task")
     s.add_argument("remote")
     s.add_argument("--hidden", action="store_true", help="also accept files and folders whose names start with a dot (never .git)")
+    s.add_argument("--merge", action="store_true", help="merge into an existing folder and replace same-named files")
     s.add_argument("local")
     s = sub.add_parser("exec")
     s.add_argument("task")

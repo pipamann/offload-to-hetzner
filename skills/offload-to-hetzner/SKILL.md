@@ -9,7 +9,7 @@ description: >
   to Vercel's offload-to-sandbox: every server gets its own SSH key, labels, an expiry and a watchdog, and a cx53
   (16 cores, 32 GB) costs about 0.05 EUR per hour.
 metadata:
-  version: "1.0.0"
+  version: "1.0.1"
   homepage: https://github.com/pipamann/offload-to-hetzner
 ---
 
@@ -118,9 +118,12 @@ VAT:
   after each change; it takes seconds. If a push fails midway, push again.
 - `put <task> <local-file> <remote-file>` copies one file and keeps its mode; `put <task> <local-dir> <remote-dir>`
   copies a folder's files (ignored ones included) into the remote folder.
-- `get <task> <remote-path> <local-path>`: a remote folder is merged into the local folder (same names are
-  replaced, other local files stay); a remote file goes to the local path, or into it when that is a folder. The
-  server ran foreign code, so `get` treats everything it sends as untrusted: only plain files and folders below the
+- `get <task> <remote-path> <local-path>`: a remote folder fills the local folder when that is new or empty;
+  when it already holds files, the result goes into a subfolder of the remote name (like `cp -r`), and if that
+  exists too, `get` refuses. A remote file goes to the local path, or into it when that is a folder, and never
+  replaces an existing file. `--merge` merges into an existing folder and replaces same-named files; use it only
+  for a results folder. `get` never writes into the home folder itself, the folders above it, or a `Library` or
+  `Applications` folder. The server ran foreign code, so `get` treats everything it sends as untrusted: only plain files and folders below the
   requested name come back, never links or device files; it never writes through a symlink at or below the local
   path; it refuses `.git` in any spelling, git's control files (`.gitattributes`, `.gitmodules`, `.lfsconfig`,
   `HEAD`, `commondir`, `gitdir`) and anything that would plant or complete a git repository; it refuses other

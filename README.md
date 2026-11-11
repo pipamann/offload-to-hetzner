@@ -54,8 +54,9 @@ about making that hard to get wrong:
 - **Secrets stay home.** Every upload and every remote command line is scanned for the values of your secret
   environment variables, your project's `.env` files and common token formats. Nothing is sent when it finds
   one.
-- **Results are untrusted.** `get` accepts only plain files below the folder you asked for, never writes through
-  symlinks, refuses `.git` and git control files, drops execute bits and has a size limit.
+- **Results are untrusted.** `get` accepts only plain files below the folder you asked for, never merges into or
+  overwrites existing files unless you pass `--merge`, never writes into your home folder or a `Library` folder,
+  never writes through symlinks, refuses `.git` and git control files, drops execute bits and has a size limit.
 - **Locked-down servers.** Each server gets its own SSH key and a host key made on your Mac (no trust on first
   use), and a firewall that only lets SSH and ping in. Servers get an IPv4 address only, so each uses one of your
   account's primary IPs instead of two.
