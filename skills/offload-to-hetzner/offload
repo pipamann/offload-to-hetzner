@@ -47,7 +47,7 @@ import unicodedata
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 STATE = Path(os.environ.get("OFFLOAD_STATE_DIR", "~/.local/state/offload-to-hetzner")).expanduser()
 _PROJECT = []  # cache for project_id()
 PREFIX = "offload-"
@@ -1306,9 +1306,13 @@ def cmd_get(a):
         for p in [src, *src.rglob("*")]:  # results are data: no execute bits from the server
             os.chmod(p, 0o755 if p.is_dir() else 0o644)
         # Where code on the Mac starts by itself, or everything else lives: never a target, not even with --merge.
-        home = Path(os.path.realpath(Path.home()))
-        no_go = [home / "Library", home / "Applications", Path("/Library"), Path("/System"), Path("/Applications")]
-        if dest == home or dest in home.parents or any(dest == p or p in dest.parents for p in no_go):
+        # Compared the way APFS compares names (case and Unicode form ignored): ~/library is ~/Library.
+        def key(p):
+            return tuple(fold(x) for x in p.parts)
+
+        home, target = key(Path(os.path.realpath(Path.home()))), key(dest)
+        no_go = [home + (fold("Library"),), home + (fold("Applications"),)] + [key(Path(x)) for x in ("/Library", "/System", "/Applications")]
+        if home[:len(target)] == target or any(target[:len(n)] == n for n in no_go):
             die(f"{dest}: get does not write into the home folder itself, the folders above it, or a Library or "
                 f"Applications folder. Pick a results folder, for example ./offload-results. Nothing copied.")
 

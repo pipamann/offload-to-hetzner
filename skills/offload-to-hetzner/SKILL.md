@@ -9,7 +9,7 @@ description: >
   to Vercel's offload-to-sandbox: every server gets its own SSH key, labels, an expiry and a watchdog, and a cx53
   (16 cores, 32 GB) costs about 0.05 EUR per hour.
 metadata:
-  version: "1.0.1"
+  version: "1.0.2"
   homepage: https://github.com/pipamann/offload-to-hetzner
 ---
 
