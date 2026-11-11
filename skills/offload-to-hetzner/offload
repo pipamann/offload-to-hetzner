@@ -1,0 +1,1573 @@
+#!/usr/bin/env python3
+"""offload: run heavy work on short-lived Hetzner Cloud servers so the Mac stays usable.
+
+https://github.com/pipamann/offload-to-hetzner (MIT). Uses `hcloud` with a Hetzner Cloud API token (read & write):
+$HCLOUD_TOKEN, or the variable named in $OFFLOAD_TOKEN_VAR, looked up in the environment, then in the files listed in
+$OFFLOAD_SECRET_FILES, then in hcloud's active context. The token travels only as an environment variable, never on
+a command line. Every server gets its own SSH key, labels for owner, task, run and expiry, and a watchdog on this Mac
+that deletes server and key at the expiry time, also right after the Mac wakes up. A launchd job (the sweeper) covers
+reboots and crashes.
+
+  offload types [--location fsn1]                       live prices of the server types on sale
+  offload create <task> [--type cx53] [--location fsn1] [--ttl 4h] [--from <base>] [--setup docker|<file>]
+  offload push <task> [<local-dir>] [<remote-dir>]      git-tracked + untracked files; keeps node_modules/.venv remotely
+  offload put <task> <local-path> <remote-path>         one file, or a folder's contents
+  offload exec <task> [--cwd <dir>] -- '<command>'      runs now, exits with the remote exit status
+  offload exec <task> --detach <job> [--cwd <dir>] -- '<command>'   keeps running when SSH drops or the Mac sleeps
+  offload wait <task> <job> [--timeout 3h]              waits for a detached job, exits with its status
+  offload logs <task> <job> [-n 40] [-f]
+  offload get <task> <remote-path> <local-path>
+  offload ls                                            all offload servers in the project, with cost so far
+  offload rm <task>...                                  deletes server and key, checks both are gone, stops the watchdog
+  offload clean [--mine | --owner <owner> | --all]      default: only expired servers, orphaned keys and local state
+  offload sweeper install|uninstall|status              launchd job: `offload sweep` at login and every 15 minutes
+  offload base create <base> [--setup docker|<file>]    snapshot to start servers from; billed while it exists
+  offload base ls | offload base rm <base>
+"""
+import argparse
+import contextlib
+import fcntl
+import fnmatch
+import io
+import json
+import math
+import os
+import plistlib
+import re
+import secrets
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import unicodedata
+from datetime import datetime
+from pathlib import Path, PurePosixPath
+
+VERSION = "1.0.0"
+STATE = Path(os.environ.get("OFFLOAD_STATE_DIR", "~/.local/state/offload-to-hetzner")).expanduser()
+_PROJECT = []  # cache for project_id()
+PREFIX = "offload-"
+MANAGED = "managed-by=offload-to-hetzner"
+IMAGE = "ubuntu-24.04"
+LOCATIONS = ["fsn1", "nbg1", "hel1"]  # tried in this order when no --location is given and a type is sold out
+DEFAULT_TYPE = os.environ.get("OFFLOAD_TYPE", "cx53")
+FIREWALL = "offload-ssh-only"  # one shared firewall, free of charge: only SSH and ping reach the servers
+JOBS = "/root/offload-jobs"
+KEEP = os.environ.get("OFFLOAD_KEEP", "node_modules .venv").split()  # heavy folders push keeps on the server
+WAIT_MARGIN = 15 * 60  # wait stops this long before the expiry, so get still has time
+ORPHAN_AGE = 15 * 60  # clean leaves younger keys and state alone, in addition to the per-task lock
+MIN_TTL = 10 * 60  # the watchdog must not fire before the server exists
+GET_MAX_BYTES = int(float(os.environ.get("OFFLOAD_GET_MAX_GB", "20")) * 1e9)  # a server cannot fill the Mac's disk
+GET_MAX_ENTRIES = 1_000_000
+SNAPSHOT_EUR_GB_MONTH = 0.0143  # Hetzner pricing API, 2026-11-09; billed on the compressed size, pro rata
+# dotenv-style files whose values the secret scan blocks; they are also searched for the token (launchd has no shell env)
+SECRET_FILES = [Path(p).expanduser() for p in os.environ.get("OFFLOAD_SECRET_FILES", "").split(":") if p]
+TOKEN_VAR = os.environ.get("OFFLOAD_TOKEN_VAR", "HCLOUD_TOKEN")
+HCLOUD_TIMEOUT = 600  # seconds per hcloud call: hcloud itself has no HTTP timeout, a stalled call must not hang cleanup
+WATCHDOG_MARK = "offload-watchdog"  # in the watchdog's argv, so a reused PID is never taken for it
+
+BOOT = "cloud-init status --wait >/dev/null 2>&1 || true"
+# apt-get update ignores DPkg::Lock::Timeout, and the first-boot package run often holds the lock: own retries.
+DOCKER_SETUP = r"""set -e
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1
+n=0; until apt-get -qq update; do n=$((n+1)); [ "$n" -lt 20 ] || exit 1; sleep 15; done
+apt-get -qq -o DPkg::Lock::Timeout=300 -y install docker.io docker-compose-v2 docker-buildx git build-essential \
+  python3 python3-venv curl jq unzip >/dev/null
+docker info --format 'Docker {{.ServerVersion}}, {{.NCPU}} cores, {{.MemTotal}} bytes RAM'
+"""
+# Prepares a builder for its snapshot: new servers from it get fresh SSH keys and machine IDs through cloud-init.
+SEAL = r"""set -e
+apt-get clean
+rm -rf /root/offload-jobs /root/.offload-setup.sh /root/work
+cloud-init clean --logs --machine-id || cloud-init clean --logs
+rm -f /root/.ssh/authorized_keys
+sync
+(sleep 2; shutdown -h now) </dev/null >/dev/null 2>&1 &
+"""
+# Unique staging folders, so two pushes cannot clobber each other; the old tree is swapped out, not deleted first.
+PUSH = r"""set -e
+dest=$1; shift
+real=$(realpath -m -- "$dest")
+[ "$real" = "$dest" ] || { echo "refusing to push: $dest resolves to $real (a link on the way)" >&2; exit 4; }
+case "$real" in """ + JOBS + r"""|""" + JOBS + r"""/*) echo "refusing to push into the job folder" >&2; exit 4;; esac
+new="$dest.new.$$" old="$dest.old.$$"
+trap 'rm -rf "$new"' EXIT
+mkdir -p "$new"
+tar -xzf - -C "$new" --no-same-owner --warning=no-unknown-keyword --warning=no-timestamp
+# One swap at a time per folder: two pushes in parallel would otherwise move one tree inside the other.
+exec 9> "$(dirname "$dest")/.$(basename "$dest").offload-lock"
+flock 9
+# Swap first, then move the kept folders over: if anything fails, they are still in $old, never deleted.
+[ -d "$dest" ] && mv "$dest" "$old"
+mv "$new" "$dest"
+trap - EXIT
+if [ -d "$old" ]; then
+  for k in "$@"; do
+    (cd "$old" && find . -maxdepth 4 -type d -name "$k" -prune -print) | while IFS= read -r keep; do
+      if [ ! -e "$dest/$keep" ]; then mkdir -p "$(dirname "$dest/$keep")"; mv "$old/$keep" "$dest/$keep"; fi
+    done
+  done
+  rm -rf "$old"
+fi
+echo "$(find "$dest" -type f | wc -l) files in $dest"
+"""
+# The pid file holds PID and boot ID: after a reboot a reused PID does not count as the job.
+ALIVE = r"""alive() { local p b; [ -r "$1" ] && read -r p b < "$1" && [ "$b" = "$(cat /proc/sys/kernel/random/boot_id)" ] && kill -0 "$p" 2>/dev/null; }
+"""
+DETACH = ALIVE + r"""set -e
+job=$1 cwd=$2 d=""" + JOBS + r"""
+mkdir -p "$d"
+# Two starts of the same job name at once would share its files: only one gets past this lock.
+exec 9> "$d/$job.lock"
+flock -n 9 || { echo "job $job is being started by another command" >&2; exit 3; }
+if [ ! -e "$d/$job.exit" ] && alive "$d/$job.pid"; then
+  echo "job $job is still running" >&2; exit 3
+fi
+rm -f "$d/$job.exit" "$d/$job.exit.tmp"
+cat > "$d/$job.sh"
+cd "$cwd"
+nohup setsid bash -c 'bash "$1" > "$2" 2>&1 < /dev/null; echo $? > "$3.tmp"; mv "$3.tmp" "$3"' job \
+  "$d/$job.sh" "$d/$job.log" "$d/$job.exit" > /dev/null 2>&1 < /dev/null 9>&- &
+echo "$! $(cat /proc/sys/kernel/random/boot_id)" > "$d/$job.pid"
+echo "job $job started, log $d/$job.log"
+"""
+POLL = ALIVE + r"""d=""" + JOBS + r""" j=$1
+if [ -e "$d/$j.exit" ]; then echo "exit $(cat "$d/$j.exit")"
+elif [ ! -e "$d/$j.pid" ]; then echo missing
+elif alive "$d/$j.pid"; then echo "running $(tail -n 1 "$d/$j.log" 2>/dev/null | cut -c1-160)"
+elif [ -e "$d/$j.exit" ]; then echo "exit $(cat "$d/$j.exit")"
+else echo dead
+fi
+"""
+GET = r"""p=$1
+[ -e "$p" ] || { echo "not found on the server: $p" >&2; exit 3; }
+cd "$(dirname "$p")" && tar -czf - -- "$(basename "$p")"
+"""
+
+# Secret scan. Names of variables that hold credentials; PAT only as a whole part, else PATH would match.
+SECRET_NAME_RE = re.compile(r"(TOKEN|SECRET|PASS|KEY|PSK|CREDENTIAL|(?:^|_)PAT(?:_|$))", re.I)
+# Values that are no secret even under such a name: bare origins, paths on this Mac, numbers, booleans.
+# Deliberately narrow: base64 secrets can start with a slash.
+HARMLESS_RE = re.compile(r"^(https?://[A-Za-z0-9.-]+(:\d+)?/?|(~|/(Users|opt|usr|private|tmp|var|etc|Applications|Library|System|bin|sbin))(/\S*)?"
+                         r"|\d+|true|false)$", re.I)
+TOKEN_RE = re.compile(
+    rb"(?P<private_key>-----BEGIN [A-Z ]*PRIVATE KEY-----)|(?P<aws_key>\bAKIA[0-9A-Z]{16}\b)"
+    rb"|(?P<github_token>\bgh[pousr]_[A-Za-z0-9]{36,}|\bgithub_pat_[A-Za-z0-9_]{40,})|(?P<gitlab_token>\bglpat-[A-Za-z0-9_-]{20,})"
+    rb"|(?P<slack_token>\bxox[abposr]-[0-9]{6,}-[A-Za-z0-9-]{10,})"
+    rb"|(?P<api_key>(?<![A-Za-z0-9_-])sk-(?:ant-|proj-)?(?=[A-Za-z0-9_-]*[0-9])(?=[A-Za-z0-9_-]*[A-Z])[A-Za-z0-9_-]{32,})"
+    rb"|(?P<stripe_live_key>\b(?:sk|rk)_live_[A-Za-z0-9]{20,})|(?P<google_api_key>\bAIza[0-9A-Za-z_-]{35})")
+SECRET_FILE_RE = re.compile(
+    r"(^|/)(\.env(\.(?!(example|sample|template|dist)$)[^/]+)?|[^/]*\.(pem|key|p12|pfx|jks|keystore|kdbx|tfstate)"
+    r"|id_(rsa|dsa|ecdsa|ed25519)|\.netrc|\.pgpass|credentials(\.json)?|service[-_]account[^/]*\.json)$", re.I)
+DATA_FILE_RE = re.compile(r"\.(sql|sql\.gz|dump|sqlite3?|db|bak)$", re.I)
+SHELL_EXPANSION_RE = re.compile(r"[A-Za-z0-9_{(@*#?$!\-]")
+
+
+def die(msg, code=1):
+    print(f"offload: {msg}", file=sys.stderr, flush=True)
+    sys.exit(code)
+
+
+def say(msg):
+    print(msg, flush=True)
+
+
+def warn(msg):
+    print(f"offload: {msg}", file=sys.stderr, flush=True)
+
+
+def lock(task):
+    """Per-task lock shared by all sessions on this Mac: create, rm, clean and base hold it while they change a task.
+    Returns the open lock file (keep a reference while working) or None when another command holds it."""
+    f = open(STATE / f".{task}.lock", "a")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return f
+    except BlockingIOError:
+        f.close()
+        return None
+
+
+def lock_or_die(task):
+    return lock(task) or die(f"another offload command is creating or removing {task} right now; try again when it is done")
+
+
+def hcloud(*args, check=True):
+    try:
+        r = subprocess.run(["hcloud", *args], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=HCLOUD_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        r = subprocess.CompletedProcess(["hcloud", *args], 124, "", f"no answer from the Hetzner API within {HCLOUD_TIMEOUT} s")
+    if check and r.returncode:
+        die(f"hcloud {' '.join(args[:2])}: {r.stderr.strip()[:400]}")
+    return r
+
+
+def hjson(*args):
+    return json.loads(hcloud(*args, "-o", "json").stdout or "null")
+
+
+LAST_ERROR = ""
+
+
+def listing(kind, selector=""):
+    """Managed servers or keys; None if the list cannot be read (the reason is kept in LAST_ERROR)."""
+    global LAST_ERROR
+    r = hcloud(kind, "list", "-l", MANAGED + ("," + selector if selector else ""), "-o", "json", check=False)
+    if r.returncode:
+        LAST_ERROR = r.stderr.strip()[:200]
+        return None
+    return json.loads(r.stdout or "null") or []
+
+
+def servers(selector=""):
+    rows = listing("server", selector)
+    if rows is None:
+        die(f"server list not readable: {LAST_ERROR}")
+    return rows
+
+
+TASK_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?")
+
+
+def task_name(text):
+    task = text.removeprefix(PREFIX)
+    if not TASK_RE.fullmatch(task):
+        die(f"task {text!r}: use 1-40 lowercase letters, digits and dashes")
+    return task
+
+
+def job_name(text):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,60}", text):
+        die(f"job {text!r}: use letters, digits, dot, dash and underscore")
+    return text
+
+
+def owner():
+    """cc-<session> inside Claude Code (it exports CLAUDE_CODE_SESSION_ID to its shells), else $OFFLOAD_OWNER, else the
+    login name: outside Claude Code, `clean --mine` then means every server this user created on this Mac."""
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    who = os.environ.get("OFFLOAD_OWNER") or (f"cc-{sid[:8]}" if sid else os.environ.get("USER", "unknown"))
+    return re.sub(r"[^a-z0-9-]", "-", who.lower())[:63].strip("-") or "unknown"
+
+
+def seconds(text):
+    m = re.fullmatch(r"(\d+)([mh])", text)
+    if not m:
+        die(f"duration {text!r}: use for example 90m or 4h")
+    return int(m.group(1)) * (60 if m.group(2) == "m" else 3600)
+
+
+def clock(ts):
+    return datetime.fromtimestamp(ts).strftime("%H:%M" if abs(ts - time.time()) < 20 * 3600 else "%Y-%m-%d %H:%M")
+
+
+def iso_ts(text):
+    return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+
+
+def state_dir(task):
+    return STATE / task
+
+
+def read_info(task):
+    f = state_dir(task) / "info.json"
+    try:
+        return json.loads(f.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def write_info(task, info):
+    f = state_dir(task) / "info.json"
+    f.with_suffix(".tmp").write_text(json.dumps(info, indent=1))
+    f.with_suffix(".tmp").replace(f)
+
+
+def need(task):
+    info = read_info(task)
+    if not info or not info.get("ip"):
+        die(f"no server for task {task} on this Mac. `offload ls` lists the servers; the SSH key exists only where create ran.")
+    return info
+
+
+def ssh_args(task, info):
+    # The host key was made on this Mac and handed to the server by cloud-init, so it is checked strictly from the
+    # first connection on; the alias keeps it independent of the IP, which Hetzner reuses.
+    d = state_dir(task)
+    return ["ssh", "-F", "/dev/null", "-i", str(d / "key"), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=yes", "-o", f'UserKnownHostsFile="{d / "known_hosts"}"', "-o", "CheckHostIP=no",
+            "-o", f"HostKeyAlias={PREFIX}{task}", "-o", "HostKeyAlgorithms=ssh-ed25519",
+            "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=4",
+            "-o", "LogLevel=ERROR", "--", f"root@{info['ip']}"]  # after --, a command starting with - is no ssh option
+
+
+def remote_line(script, *args):
+    """A bash script for the server; the arguments arrive as $1, $2 ... without any local shell expansion."""
+    return " ".join(["bash", "-c", shlex.quote(script), "offload", *map(shlex.quote, args)])
+
+
+def remote(task, info, script, *args, **kw):
+    return subprocess.run([*ssh_args(task, info), remote_line(script, *args)], **kw)
+
+
+def pipe_to_remote(producer, task, info, script, *args, cwd=None):
+    """producer | ssh server script: returns (producer status, ssh status)."""
+    prod = subprocess.Popen(producer, cwd=cwd, stdout=subprocess.PIPE, env=dict(os.environ, COPYFILE_DISABLE="1"))
+    ssh = subprocess.Popen([*ssh_args(task, info), remote_line(script, *args)], stdin=prod.stdout)
+    prod.stdout.close()  # so the producer gets SIGPIPE if ssh ends early
+    return prod.wait(), ssh.wait()
+
+
+# ---------------------------------------------------------------- secret scan
+
+def shell_value(rest):
+    """Value after NAME= as a shell would set it, without running anything (export X="a\\"b" # c gives a"b).
+    None for a reference such as $Y, whose value is unknown here. ValueError for syntax that cannot be read safely."""
+    s, i, parts = rest.strip(), 0, []
+
+    def reference(pos):
+        return s[pos] == "`" or (s[pos] == "$" and pos + 1 < len(s) and bool(SHELL_EXPANSION_RE.match(s[pos + 1])))
+
+    if rest[:1].isspace() and s.startswith("#"):
+        return ""
+    while i < len(s) and not s[i].isspace():
+        c = s[i]
+        if c == "'":
+            end = s.find("'", i + 1)
+            if end < 0:
+                raise ValueError("open single quote")
+            parts.append(s[i + 1:end])
+            i = end + 1
+        elif c == '"':
+            i += 1
+            while i < len(s) and s[i] != '"':
+                if s[i] == "\\" and i + 1 < len(s):
+                    parts.append(s[i + 1] if s[i + 1] in '$`"\\' else s[i:i + 2])
+                    i += 2
+                    continue
+                if reference(i):
+                    return None
+                parts.append(s[i])
+                i += 1
+            if i >= len(s):
+                raise ValueError("open double quote")
+            i += 1
+        elif c == "\\":
+            if i + 1 >= len(s):
+                raise ValueError("backslash at end of line")
+            parts.append(s[i + 1])
+            i += 2
+        elif reference(i):
+            return None
+        elif c in ";&|<>()" or (c == "$" and s[i + 1:i + 2] in ("'", '"')):
+            raise ValueError("shell operator outside quotes")
+        else:
+            parts.append(c)
+            i += 1
+    return "".join(parts)
+
+
+ENV_SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "vendor", "dist", "build", "target", "__pycache__"}
+
+
+def project_env_files(base):
+    """The .env* files of the project around `base`: in base, in the current folder, and up to three folder levels
+    below the git work tree root (monorepos keep them in apps/<name>/.env). Templates (.example ...) are skipped."""
+    roots = [base.resolve(), Path.cwd()]
+    r = subprocess.run(["git", "-C", str(base), "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    top = Path(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else None
+    found = set()
+    for root in roots:
+        found |= {p for p in root.glob(".env*")}
+    if top:
+        for here, dirs, names in os.walk(top):
+            depth = len(Path(here).relative_to(top).parts)
+            dirs[:] = [] if depth >= 3 else [x for x in dirs if x not in ENV_SKIP_DIRS]
+            found |= {Path(here) / n for n in names if n.startswith(".env")}
+    return sorted(p for p in found if p.is_file() and not re.search(r"\.(example|sample|template|dist)$", p.name))
+
+
+def raw_value(rest):
+    """The text after NAME= taken literally (dotenv parsers keep `$` as is): quotes and a trailing comment removed."""
+    s = re.sub(r"\s+#.*$", "", rest.strip())
+    return s[1:-1] if len(s) >= 2 and s[0] == s[-1] and s[0] in "'\"" else s
+
+
+def secret_values(base):
+    """Known secret values (bytes -> variable name): environment variables with secret-like names, every
+    assignment in the files of $OFFLOAD_SECRET_FILES, and the project's own .env files."""
+    found = {}
+
+    def add(value, name):
+        # Values under a credential-like name count from 8 characters, numbers included; any other value in a
+        # secrets file from 12 characters, without origins, local paths and numbers (fewer false alarms).
+        named = bool(SECRET_NAME_RE.search(name))
+        harmless = HARMLESS_RE.match(value or "") and not (named and value.isdigit())
+        if value and len(value) >= (8 if named else 12) and not harmless:
+            found.setdefault(value.encode(errors="surrogateescape"), name)
+
+    for name, value in os.environ.items():
+        if SECRET_NAME_RE.search(name):
+            add(value, name)
+    for path, strict in [(p, True) for p in SECRET_FILES] + [(p, False) for p in project_env_files(base)]:
+        if not path.exists():
+            say(f"secret scan: {path} not found, scanning without it")
+            continue
+        for number, line in enumerate(path.read_text(errors="ignore").splitlines(), 1):
+            m = re.match(r"\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)", line)
+            if not m:
+                continue
+            try:
+                value = shell_value(m.group(2))
+                # In a project .env file, $ is a literal for dotenv loaders (a shell would expand it): count it as written.
+                add(raw_value(m.group(2)) if value is None and not strict else value, m.group(1))
+            except ValueError as err:
+                if strict:  # only line number and reason, never the value
+                    die(f"{path}, line {number} not readable ({err}). Write it more simply; the file is never executed.")
+                say(f"secret scan: {path.name} line {number} skipped ({err})")
+    return found
+
+
+def secret_matchers(base):
+    values = secret_values(base)
+    rx = re.compile(b"|".join(re.escape(v) for v in sorted(values, key=len, reverse=True))) if values else None
+    return values, rx
+
+
+def find_secret(data, values, rx):
+    if rx and (m := rx.search(data)):
+        return f"contains the value of ${values[m.group(0)]}"
+    if m := TOKEN_RE.search(data):
+        return f"looks like a {m.lastgroup.replace('_', ' ')}"
+    return None
+
+
+def scan(base, files, allow):
+    """Blocks the upload if a file name suggests credentials or data dumps, or a file contains a known secret value or
+    a common token format. Blind to secrets that are neither known here nor in a known format: customer data needs judgment."""
+    values, rx = secret_matchers(base)
+    overlap = max([len(v) for v in values] + [200])
+    hits, allowed, size = [], 0, 0
+    for rel in files:
+        if any(fnmatch.fnmatch(rel, g) for g in allow):
+            allowed += 1
+            continue
+        if SECRET_FILE_RE.search(rel):
+            hits.append(f"{rel}: file name suggests credentials")
+            continue
+        if DATA_FILE_RE.search(rel):
+            hits.append(f"{rel}: database dump or data file (customer data stays on the Mac)")
+            continue
+        path = base / rel
+        if path.is_symlink():
+            continue  # uploaded as a link; the target is not uploaded
+        size += path.stat().st_size
+        with open(path, "rb") as f:
+            tail = b""
+            while chunk := f.read(8 << 20):
+                buf = tail + chunk
+                if why := find_secret(buf, values, rx):
+                    hits.append(f"{rel}: {why}")
+                    break
+                tail = buf[-overlap:]
+    note = f", {allowed} skipped by --allow" if allowed else ""
+    say(f"secret scan: {len(files)} files, {size / 1e6:.1f} MB, {len(values)} known values + token formats, {len(hits)} hits{note}")
+    if hits:
+        for h in hits[:40]:
+            print(f"  BLOCKED {h}", file=sys.stderr)
+        die("nothing uploaded. Remove these files or values, or pass --allow <path or glob> after checking each one is harmless.")
+
+
+def check_outgoing(*texts):
+    """Every string that goes to the server outside a scanned file: commands, --cwd, remote paths."""
+    values, rx = secret_matchers(Path.cwd())
+    for text in texts:
+        if text and (why := find_secret(text.encode(errors="surrogateescape"), values, rx)):
+            die(f"an argument for the server {why}. Nothing sent. Keep secrets on the Mac (check for a $VAR your shell expanded).")
+
+
+# ---------------------------------------------------------------- server lifecycle
+
+def start_watchdog(task, info):
+    """A detached process on this Mac that deletes server and key of this run at the expiry. caffeinate -i keeps the
+    Mac from idle sleep meanwhile (closing the lid on battery still sleeps it). The token reaches it through the
+    environment only."""
+    log = state_dir(task) / "watchdog.log"
+    cmd = [sys.executable, str(Path(__file__).resolve()), "_watchdog", WATCHDOG_MARK, info["run"], str(info["expires"]), str(log)]
+    if shutil.which("caffeinate"):
+        cmd = ["caffeinate", "-i", *cmd]
+    p = subprocess.Popen(["nohup", *cmd], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    return p.pid
+
+
+def watchdog_alive(info):
+    pid = info.get("watchdog_pid")
+    args = subprocess.run(["ps", "-ww", "-o", "args=", "-p", str(pid)], capture_output=True, text=True).stdout if pid else ""
+    return WATCHDOG_MARK in args and info["run"] in args  # never a process that merely reuses the PID
+
+
+def cmd_watchdog(argv):
+    """The watchdog itself (`offload _watchdog offload-watchdog <run> <expires> <log>`). It compares wall-clock time
+    every 30 seconds instead of one long sleep, because macOS stops sleep timers while the Mac sleeps: a Mac that slept
+    past the expiry deletes within a minute of waking. Keeps trying until both lists are readable and empty, for up to
+    48 hours after the expiry (a Mac that wakes up offline gets time to reconnect)."""
+    _, run, expires, log = argv
+    expires, log = int(expires), Path(log)
+
+    def note(msg):
+        try:  # the state folder may have been deleted meanwhile; the deletion must not depend on the log
+            log.parent.mkdir(parents=True, exist_ok=True)
+            with open(log, "a") as f:
+                f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}\n")
+        except OSError:
+            pass
+
+    note(f"watching run {run}, deletes at {datetime.fromtimestamp(expires):%Y-%m-%d %H:%M:%S}")
+    while time.time() < expires:
+        time.sleep(max(1, min(30, expires - time.time())))
+    note("expiry reached, deleting")
+    for kind in ("server", "ssh-key"):
+        while (found := listing(kind, f"offload-run={run}")) != []:
+            if time.time() > expires + 48 * 3600:
+                note(f"GAVE UP: {kind} of run {run} may still exist, run `offload clean`")
+                sys.exit(1)
+            for item in found or []:
+                r = hcloud(kind, "delete", str(item["id"]), check=False)
+                note(f"{kind} {item['name']}: " + ("deleted" if r.returncode == 0 else f"not deleted: {r.stderr.strip()[:200]}"))
+            if found is None:
+                note(f"{kind} list not readable: {LAST_ERROR}")
+            time.sleep(5 if found else 60)
+    note(f"watchdog done: server and key of run {run} are gone")
+
+
+def stop_watchdog(info):
+    pid = info.get("watchdog_pid")
+    if pid and watchdog_alive(info):
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def firewall_ok(fw):
+    """Only the firewall offload made itself counts: its label, and inbound exactly SSH and ping."""
+    inbound = sorted((x.get("protocol"), x.get("port") or "") for x in fw.get("rules") or [] if x.get("direction") == "in")
+    return (fw.get("labels") or {}).get("managed-by") == "offload-to-hetzner" and inbound == [("icmp", ""), ("tcp", "22")]
+
+
+def ensure_firewall():
+    r = hcloud("firewall", "describe", FIREWALL, "-o", "json", check=False)
+    if r.returncode == 0:
+        if not firewall_ok(json.loads(r.stdout or "{}")):
+            die(f"a firewall named {FIREWALL} exists in this project, but it is not the one offload creates (label "
+                f"{MANAGED}, inbound only tcp/22 and icmp). Rename or fix it in the Hetzner Console; nothing created.")
+        return
+    rules = [{"direction": "in", "protocol": "tcp", "port": "22", "source_ips": ["0.0.0.0/0", "::/0"], "description": "ssh"},
+             {"direction": "in", "protocol": "icmp", "source_ips": ["0.0.0.0/0", "::/0"], "description": "ping"}]
+    r = subprocess.run(["hcloud", "firewall", "create", "--name", FIREWALL, "--label", MANAGED, "--rules-file", "-"],
+                       input=json.dumps(rules), capture_output=True, text=True)
+    if r.returncode and hcloud("firewall", "describe", FIREWALL, check=False).returncode:  # a parallel create may have won
+        die(f"firewall {FIREWALL} not created: {r.stderr.strip()[:300]}")
+
+
+def hourly_price(server_type, location):
+    for p in server_type["prices"]:
+        if p["location"] == location:
+            return float(p["price_hourly"]["gross"])
+    return None
+
+
+def newest_snapshot(base):
+    rows = [i for i in hjson("image", "list", "--type", "snapshot", "-l", f"{MANAGED},offload-base={base}") or [] if i["status"] == "available"]
+    return max(rows, key=lambda i: i["created"]) if rows else None
+
+
+def limit_hint(err):
+    if "limit" in err.lower():
+        return ("\nAn account limit is reached (shared vCPUs, dedicated vCPUs, primary IPs or servers). Limits count across "
+                "all projects of the Hetzner account, permanent servers included. Current use and a request form: Hetzner "
+                "Console, Limits, \"Request limit increase\". Ask the user before requesting more; a modest request can "
+                "be approved automatically within seconds.")
+    return ""
+
+
+def wait_for_ssh(task, info):
+    for _ in range(60):
+        try:
+            if remote(task, info, "true", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30).returncode == 0:
+                return
+        except subprocess.TimeoutExpired:
+            pass
+        time.sleep(5)
+    die("the server does not answer on SSH after 5 minutes")
+
+
+def run_setup(task, info, what):
+    if what == "docker":
+        script = DOCKER_SETUP
+    else:
+        path = Path(what).expanduser().resolve()  # a link is scanned and sent as its target
+        if not path.is_file():
+            die(f"setup script {what} not found")
+        scan(path.parent, [path.name], [])
+        script = path.read_text()
+    say(f"setup: {what}")
+    # cat takes the whole script first, so commands in it cannot swallow the rest of it from stdin
+    r = remote(task, info, "cat > /root/.offload-setup.sh && bash /root/.offload-setup.sh < /dev/null", input=script, text=True)
+    if r.returncode:
+        die(f"setup failed (exit {r.returncode})")
+
+
+def cmd_create(a):
+    task = task_name(a.task)
+    name, d, ttl = PREFIX + task, state_dir(task), seconds(a.ttl)
+    if not MIN_TTL <= ttl <= 24 * 3600:
+        die("--ttl must be between 10m and 24h")
+    held = lock_or_die(task)  # returned to the caller, which may keep holding it (base create)
+    if not sweeper_installed():
+        warn("the sweeper is not installed (`offload sweeper install`): after a reboot or crash nothing would delete this server")
+    if name in {s["name"] for s in hjson("server", "list") or []}:
+        die(f"{name} already exists. Use it, or remove it first with `offload rm {task}`. Nothing changed.")
+    stype = hjson("server-type", "describe", a.type)
+    image = IMAGE
+    if a.base:
+        snap = newest_snapshot(a.base) or die(f"no base snapshot {a.base!r}; `offload base ls` lists them")
+        if snap["architecture"] != stype["architecture"] or stype["disk"] < snap["disk_size"]:
+            die(f"base {a.base} is {snap['architecture']} with a {snap['disk_size']:.0f} GB disk, {a.type} is "
+                f"{stype['architecture']} with {stype['disk']} GB: pick another type")
+        image = str(snap["id"])
+    old = read_info(task)
+    if old and old.get("run") and not remove_run(task, old["run"]):  # an earlier run's key or state is left over
+        die(f"an earlier run of {task} could not be cleaned up; nothing created")
+    shutil.rmtree(d, ignore_errors=True)
+    d.mkdir(parents=True, mode=0o700)
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", name, "-f", str(d / "key")], check=True)
+    # The server's host key, made here: cloud-init installs it, known_hosts has it before the first connection.
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", f"{name}-host", "-f", str(d / "hostkey")], check=True)
+    host_pub = (d / "hostkey.pub").read_text().strip()
+    (d / "known_hosts").write_text(f"{name} {' '.join(host_pub.split()[:2])}\n")
+    cloud_config = {"ssh_deletekeys": True, "ssh_keys": {"ed25519_private": (d / "hostkey").read_text(), "ed25519_public": host_pub}}
+    (d / "user-data").write_text("#cloud-config\n" + json.dumps(cloud_config) + "\n")
+    os.chmod(d / "user-data", 0o600)
+    now = int(time.time())
+    info = {"task": task, "run": secrets.token_hex(4), "owner": owner(), "type": a.type, "created": now, "expires": now + ttl,
+            }
+    write_info(task, info)
+    # The watchdog starts before anything exists at Hetzner, so no moment leaves a server without one.
+    info["watchdog_pid"] = start_watchdog(task, info)
+    write_info(task, info)
+    time.sleep(1)
+    if not watchdog_alive(info):
+        die(f"the watchdog did not start (see {d / 'watchdog.log'}); nothing created at Hetzner")
+    labels = [MANAGED, f"offload-run={info['run']}", f"offload-task={task}", f"offload-owner={info['owner']}", f"offload-expires={info['expires']}"]
+    flags = [x for label in labels for x in ("--label", label)]
+    try:
+        ensure_firewall()
+        info["project"] = project_id()
+        write_info(task, info)
+        keyname = f"{name}-{info['run']}"
+        hcloud("ssh-key", "create", "--name", keyname, "--public-key-from-file", str(d / "key.pub"), *flags[:6])
+        locations = [a.location] if a.location else LOCATIONS
+        for loc in locations:
+            r = hcloud("server", "create", "--name", name, "--type", a.type, "--image", image, "--location", loc, "--ssh-key", keyname,
+                       "--firewall", FIREWALL, "--user-data-from-file", str(d / "user-data"), "--without-ipv6",  # one primary IP
+                       *flags, "-o", "json", check=False)                                      # per server, not two
+            if r.returncode == 0:
+                break
+            err = r.stderr.strip()
+            if "unavailable" not in err.lower() or loc == locations[-1]:
+                die(f"server not created: {err[:400]}{limit_hint(err)}")
+            say(f"{a.type} is not available in {loc}, trying the next location")
+        srv = json.loads(r.stdout)["server"]
+        info.update(id=srv["id"], ip=srv["public_net"]["ipv4"]["ip"], location=loc, price_hourly=hourly_price(stype, loc))
+        write_info(task, info)
+        # A watchdog that already ran (stalled create) or died would leave this server without a safety net.
+        if not watchdog_alive(info) or time.time() > info["expires"] - 5 * 60:
+            die("the watchdog is not running or the expiry is too close; deleting the new server")
+        price = f"{info['price_hourly']:.4f} EUR/h" if info["price_hourly"] else "price unknown"
+        say(f"{name}: {a.type} ({stype['cores']} {stype['cpu_type']} cores, {stype['memory']:.0f} GB) in {loc}, {price}, "
+            f"IP {info['ip']}. Watchdog deletes it at {clock(info['expires'])}. Waiting for SSH ...")
+        wait_for_ssh(task, info)
+        remote(task, info, BOOT, check=True)
+        if a.setup:
+            run_setup(task, info, a.setup)
+        say(f"ready: offload push {task} . | offload exec {task} -- '<command>' | offload rm {task}")
+        return held
+    except BaseException:
+        warn("create or setup failed, deleting server and key right away")
+        remove_run(task, info["run"])
+        raise
+
+
+def delete_all(kind, selector, tries):
+    """Deletes every managed server or key matching the selector; True only once the list is readable and empty."""
+    for _ in range(tries):
+        found = listing(kind, selector)
+        if found == []:
+            return True
+        for item in found or []:
+            hcloud(kind, "delete", str(item["id"]), check=False)
+        time.sleep(3 if found else 15)
+    return listing(kind, selector) == []
+
+
+def remove_run(task, run):
+    """Deletes server and key of one run and checks both lists. Only then the watchdog stops and the local key goes:
+    if the deletion fails, the watchdog stays as the fallback. Returns False when something is left; the caller holds
+    the task lock."""
+    mine = read_info(task)
+    if mine and mine.get("run") == run and mine.get("project") and project_id() != mine["project"]:
+        # Lists of another project are empty for this run: removing its local key and watchdog would leave it billing.
+        warn(f"{task} was created in another Hetzner project (its firewall {FIREWALL} has another ID, or the current token "
+             f"cannot see it). Use a token of that project to remove it; nothing changed.")
+        return False
+    sel = f"offload-run={run}"
+    if not delete_all("server", sel, 4):
+        warn(f"ATTENTION: the server of {task} (run {run}) is not deleted or the list is not readable. It keeps billing; "
+             f"the watchdog stays active. Retry `offload rm {task}`.")
+        return False
+    if not delete_all("ssh-key", sel, 3):
+        warn(f"server of {task} deleted, but its SSH key is still listed or the list is not readable. The watchdog stays "
+             f"active; retry `offload rm {task}` or `offload clean` later.")
+        return False
+    info = read_info(task)
+    if info and info.get("run") == run:
+        stop_watchdog(info)
+        used = time.time() - info["created"]
+        hours = max(1, math.ceil(used / 3600))
+        cost = f", billed {hours} h x {info['price_hourly']:.4f} = {hours * info['price_hourly']:.2f} EUR" if info.get("price_hourly") else ""
+        say(f"{PREFIX}{task}: server and key deleted and no longer listed; ran {used / 60:.0f} min{cost}")
+        shutil.rmtree(state_dir(task), ignore_errors=True)
+    else:
+        say(f"{PREFIX}{task} (run {run}): server and key deleted and no longer listed")
+    return True
+
+
+def cmd_rm(a):
+    ok = True
+    for text in a.tasks:
+        task = task_name(text)
+        held = lock(task)
+        if not held:
+            warn(f"{task}: skipped, another offload command is creating or removing it right now")
+            ok = False
+            continue
+        info = read_info(task)
+        runs = {info["run"]} if info and info.get("run") else set()
+        keys, rows = listing("ssh-key", f"offload-task={task}"), listing("server", f"offload-task={task}")
+        if keys is None or rows is None:
+            warn(f"{task}: server or key list not readable; nothing removed, retry")
+            ok = False
+            held.close()
+            continue
+        runs |= {x["labels"]["offload-run"] for x in rows + keys if x["labels"].get("offload-run")}
+        if not runs:
+            say(f"{task}: nothing to remove")
+        for run in sorted(runs):
+            ok = remove_run(task, run) and ok
+        held.close()
+    sys.exit(0 if ok else 1)
+
+
+def expiry(server):
+    try:
+        return int(server["labels"].get("offload-expires", "0"))
+    except ValueError:
+        return 0
+
+
+def clean(everything=False, who=None, grace=0):
+    """Deletes servers (all, one owner's, or those more than `grace` seconds past their expiry), then orphaned keys and
+    local state of vanished servers. Returns (ok, names of the deleted servers)."""
+    now = time.time()
+    rows = servers()
+    if everything:
+        victims = rows
+    elif who:
+        victims = [s for s in rows if s["labels"].get("offload-owner") == who]
+    else:
+        victims = [s for s in rows if expiry(s) <= now - grace]
+    ok, removed = True, []
+    for s in victims:
+        task, run = s["labels"].get("offload-task", s["name"].removeprefix(PREFIX)), s["labels"].get("offload-run")
+        if not TASK_RE.fullmatch(task):  # labels come from the project, not from this Mac: no path from them
+            warn(f"{s['name']}: skipped, its task label {task!r} is not a valid task name")
+            ok = False
+            continue
+        held = lock(task)
+        if not held:
+            say(f"{s['name']}: skipped, another offload command is working on it")
+            continue
+        if run:
+            done = remove_run(task, run)
+            gone = done or listing("server", f"offload-run={run}") == []  # the server can be gone while its key is not
+        else:
+            done = gone = hcloud("server", "delete", str(s["id"]), check=False).returncode == 0
+            say(f"{s['name']}: " + ("deleted (it had no run label)" if done else "NOT deleted"))
+        ok = ok and done
+        if gone:
+            removed.append(s["name"])
+        held.close()
+    live = {s["labels"].get("offload-run") for s in servers()}
+    keys = listing("ssh-key")
+    if keys is None:
+        warn("key list not readable: orphaned keys and local state left as they are")
+        return False, removed
+    for k in keys:
+        task, run = k["labels"].get("offload-task", ""), k["labels"].get("offload-run")
+        if run in live or now - iso_ts(k["created"]) < ORPHAN_AGE or (task and not TASK_RE.fullmatch(task)):
+            continue
+        held = lock(task) if task else None
+        if task and not held:
+            continue
+        if run and listing("server", f"offload-run={run}") != []:  # re-checked under the lock: a server appeared
+            if held:
+                held.close()
+            continue
+        if hcloud("ssh-key", "delete", str(k["id"]), check=False).returncode == 0:
+            say(f"orphaned key {k['name']} deleted")
+        else:
+            warn(f"orphaned key {k['name']} could not be deleted")
+            ok = False
+        if held:
+            held.close()
+    keys = listing("ssh-key")
+    key_runs = {k["labels"].get("offload-run") for k in keys} if keys is not None else None
+    for d in sorted(STATE.iterdir()):
+        info = read_info(d.name)
+        if not (d.is_dir() and info) or key_runs is None or info.get("run") in live | key_runs or now - info.get("created", 0) < ORPHAN_AGE:
+            continue
+        if info.get("project") and project_id() != info["project"]:  # another project: empty lists here prove nothing
+            continue
+        held = lock(d.name)
+        if held:
+            sel = f"offload-run={info.get('run')}"
+            if read_info(d.name) == info and listing("server", sel) == [] and listing("ssh-key", sel) == []:  # re-checked under the lock
+                stop_watchdog(info)
+                shutil.rmtree(d, ignore_errors=True)
+                say(f"local state of {d.name} removed (its server and key no longer exist)")
+            held.close()
+    return ok, removed
+
+
+def cmd_clean(a):
+    ok, removed = clean(everything=a.all, who=a.owner or (owner() if a.mine else None))
+    left = servers()
+    say(f"clean done: {len(removed)} servers removed, {len(left)} offload servers left" + (f": {', '.join(s['name'] for s in left)}" if left else ""))
+    sys.exit(0 if ok else 1)
+
+
+# ---------------------------------------------------------------- sweeper (launchd)
+
+SWEEPER_LABEL = "com.github.pipamann.offload-to-hetzner.sweeper"
+SWEEPER_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{SWEEPER_LABEL}.plist"
+# A stable copy for launchd: plugin installs live in versioned folders that an update removes.
+SWEEPER_BIN = STATE / "bin" / "offload"
+SWEEP_GRACE = 2 * 60  # the server's own watchdog goes first; the sweeper handles what a reboot or crash left
+LOG_MAX = 256 * 1024
+
+
+def token_from_files():
+    """The token variable from the files in $OFFLOAD_SECRET_FILES, read as text, never executed."""
+    for path in SECRET_FILES:
+        try:
+            lines = path.read_text(errors="ignore").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            if m := re.match(rf"\s*(?:export\s+)?{re.escape(TOKEN_VAR)}\s*=(.*)", line):
+                try:
+                    return shell_value(m.group(1)) or None
+                except ValueError:
+                    return None
+    return None
+
+
+def token_from_context():
+    """The token of hcloud's active context (`hcloud context create`), as hcloud itself would pick it."""
+    try:
+        import tomllib
+        data = tomllib.loads(Path(os.environ.get("HCLOUD_CONFIG", "~/.config/hcloud/cli.toml")).expanduser().read_text())
+    except (ImportError, OSError, ValueError):
+        return None
+    active = os.environ.get("HCLOUD_CONTEXT") or data.get("active_context")
+    return next((c.get("token") for c in data.get("contexts", []) if c.get("name") == active and c.get("token")), None)
+
+
+def resolve_token():
+    return os.environ.get(TOKEN_VAR) or token_from_files() or token_from_context()
+
+
+def use_token(token):
+    """Hands the token to hcloud and the watchdog through the environment, never on a command line."""
+    os.environ["HCLOUD_TOKEN"] = token
+
+
+def project_id():
+    """Which Hetzner project the current token belongs to, told by the ID of offload's firewall there (IDs are unique
+    across Hetzner; the firewall is made once per project and kept). A new token for the same project gives the same
+    ID; None when the firewall is missing or the API does not answer."""
+    if not _PROJECT:
+        r = hcloud("firewall", "describe", FIREWALL, "-o", "json", check=False)
+        _PROJECT.append(str(json.loads(r.stdout)["id"]) if r.returncode == 0 and r.stdout.strip() else None)
+    return _PROJECT[0]
+
+
+def version_of(path):
+    try:
+        m = re.search(r'^VERSION = "([\d.]+)"', path.read_text(errors="ignore"), re.M)
+    except OSError:
+        return None
+    return tuple(int(x) for x in m.group(1).split(".")) if m else None
+
+
+def sweeper_installed():
+    """The launchd job exists and runs the stable copy, which exists."""
+    try:
+        args = plistlib.loads(SWEEPER_PLIST.read_bytes()).get("ProgramArguments") or []
+    except (OSError, ValueError):
+        return False
+    return str(SWEEPER_BIN) in args and SWEEPER_BIN.exists()
+
+
+def install_bin():
+    SWEEPER_BIN.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = SWEEPER_BIN.with_name(f".offload.{os.getpid()}")
+    shutil.copyfile(Path(__file__).resolve(), tmp)
+    os.chmod(tmp, 0o755)
+    tmp.replace(SWEEPER_BIN)
+
+
+def refresh_bin():
+    """After a plugin update, the next offload command brings the sweeper's copy up to date (never downgrades it)."""
+    here, there = tuple(int(x) for x in VERSION.split(".")), version_of(SWEEPER_BIN)
+    if there is not None and here > there and sweeper_installed():
+        install_bin()
+
+
+def rotate(path):
+    try:
+        if path.stat().st_size > LOG_MAX:
+            path.replace(path.with_name(path.name + ".1"))
+    except OSError:
+        pass
+
+
+def notify(message):
+    """macOS notification; the text is passed as an argument, never spliced into the AppleScript."""
+    if not shutil.which("osascript"):
+        return "no osascript"
+    return subprocess.run(["osascript", "-e", "on run argv", "-e", 'display notification (item 1 of argv) with title "offload sweeper"',
+                           "-e", "end run", message], capture_output=True).returncode
+
+
+def cmd_sweep(a):
+    """Run by launchd at login and at :00, :15, :30 and :45 (`offload sweeper install`); a tick missed during sleep runs
+    on wake. Deletes servers more than 2 minutes past their expiry, orphaned keys and stale local state: what a watchdog
+    killed by a reboot or crash leaves behind. Notifies when it had to delete a server, and when cleanup keeps failing
+    (two runs in a row, only if offload servers may exist, at most every 6 hours)."""
+    log, state_file = STATE / "sweeper.log", STATE / "sweeper-state.json"
+    rotate(log)
+    rotate(STATE / "sweeper-launchd.log")
+    try:
+        st = json.loads(state_file.read_text())
+    except (OSError, ValueError):
+        st = {}
+    out, ok, removed, left, seen = io.StringIO(), False, [], [], None
+    token = resolve_token()
+    if not token:
+        out.write(f"no token: ${TOKEN_VAR} is not in the files of OFFLOAD_SECRET_FILES and hcloud has no active context\n")
+    else:
+        use_token(token)
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                ok, removed = clean(grace=SWEEP_GRACE)
+                rows = servers()
+                left = [s["name"] for s in rows if expiry(s) <= time.time() - SWEEP_GRACE]
+                seen = len(rows)
+        except SystemExit:  # die() inside: a list not readable, hcloud missing ...
+            ok = False
+        except Exception as err:  # noqa: BLE001 (logged, and counted as a failed run)
+            out.write(f"error: {err!r}\n")
+            ok = False
+    ok = ok and not left
+    now = time.time()
+    local_state = any((d / "info.json").exists() for d in STATE.iterdir() if d.is_dir())
+    if seen is not None:  # whenever the list was readable, also on a failed run
+        st["servers_seen"] = seen
+    if ok:
+        st["failures"] = 0
+        status = f"ok, deleted {', '.join(removed)}" if removed else "ok, nothing to do"
+    else:
+        st["failures"] = st.get("failures", 0) + 1
+        status = f"FAILED ({st['failures']} runs in a row)" + (f", still past expiry: {', '.join(left)}" if left else "")
+    message = f"Deleted {', '.join(removed)}: past its expiry and its watchdog was gone (reboot or crash?)." if removed else ""
+    if (not ok and st["failures"] >= 2 and (local_state or left or st.get("servers_seen")) and now - st.get("notified", 0) > 6 * 3600):
+        message += (" " if message else "") + (f"Still billing: {', '.join(left)}. " if left else "") + \
+            f"Cleanup keeps failing; see {log}"
+        st["notified"] = now
+    if message:
+        status += f"; notified (osascript {notify(message)})"
+    details = " | ".join(line.strip() for line in out.getvalue().splitlines() if line.strip())
+    with open(log, "a") as f:
+        f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {status}" + (f" :: {details}" if details and (removed or not ok) else "") + "\n")
+    state_file.write_text(json.dumps(st))
+    sys.exit(0 if ok else 1)
+
+
+def sweeper_plist():
+    """Made on this Mac at install time: its Python, its hcloud, its state folder. Names of settings, never the token."""
+    py = shutil.which("python3") or sys.executable
+    hc = shutil.which("hcloud") or die("hcloud not found on PATH; install it first (brew install hcloud)")
+    dirs = [str(Path(sys.executable).parent), str(Path(py).parent), str(Path(hc).parent),
+            "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+    env = {"PATH": ":".join(dict.fromkeys(dirs)), "OFFLOAD_STATE_DIR": str(STATE), "OFFLOAD_TOKEN_VAR": TOKEN_VAR}
+    if SECRET_FILES:
+        env["OFFLOAD_SECRET_FILES"] = ":".join(str(p.resolve()) for p in SECRET_FILES)  # launchd runs from /
+    for name in ("HCLOUD_CONFIG", "HCLOUD_CONTEXT"):
+        if os.environ.get(name):
+            env[name] = os.environ[name]
+    return {
+        "Label": SWEEPER_LABEL,
+        # env python3 on the PATH above: the job keeps working when Homebrew moves to a new Python version
+        "ProgramArguments": ["/usr/bin/env", "python3", "-I", str(SWEEPER_BIN), "sweep"],
+        "EnvironmentVariables": env,
+        "RunAtLoad": True,
+        # Calendar ticks, not StartInterval: launchd runs a calendar tick missed during sleep once on wake, but drops
+        # missed interval ticks (man launchd.plist). So a Mac that slept past an expiry cleans up right after waking.
+        "StartCalendarInterval": [{"Minute": m} for m in (0, 15, 30, 45)],
+        "ProcessType": "Background",
+        "StandardOutPath": str(STATE / "sweeper-launchd.log"),
+        "StandardErrorPath": str(STATE / "sweeper-launchd.log"),
+    }
+
+
+def cmd_sweeper(a):
+    """Installs, removes or shows the launchd job that runs `offload sweep`; install and uninstall are idempotent."""
+    domain = f"gui/{os.getuid()}"
+    if a.action in ("install", "uninstall"):
+        subprocess.run(["launchctl", "bootout", f"{domain}/{SWEEPER_LABEL}"], capture_output=True)
+        SWEEPER_PLIST.unlink(missing_ok=True)
+    if a.action == "install":
+        if not (token_from_files() or token_from_context()):
+            die(f"the sweeper runs without your shell's environment, so it cannot see ${TOKEN_VAR} there. Put the token "
+                f"into a file listed in OFFLOAD_SECRET_FILES (a line {TOKEN_VAR}=...), or into an hcloud context "
+                f"(`hcloud context create <name>`), then install again. Nothing installed.")
+        install_bin()
+        SWEEPER_PLIST.parent.mkdir(parents=True, exist_ok=True)
+        SWEEPER_PLIST.write_bytes(plistlib.dumps(sweeper_plist()))
+        log = STATE / "sweeper.log"
+
+        def stamp():  # inode and size: the first run may rotate the log, which makes a new, shorter file
+            try:
+                st = log.stat()
+                return st.st_ino, st.st_size
+            except OSError:
+                return None
+
+        before = stamp()
+        for attempt in range(5):  # bootstrap right after bootout can fail with "Input/output error" for a moment
+            r = subprocess.run(["launchctl", "bootstrap", domain, str(SWEEPER_PLIST)], capture_output=True, text=True)
+            if r.returncode == 0:
+                break
+            time.sleep(1)
+        else:
+            die(f"launchctl bootstrap failed: {r.stderr.strip()}")
+        for _ in range(60):  # RunAtLoad starts one round right away: wait for its log line to prove the job really works
+            if stamp() not in (None, before):
+                break
+            time.sleep(1)
+        else:
+            die(f"the sweeper is installed but wrote nothing within a minute; check {STATE / 'sweeper-launchd.log'}")
+        last = log.read_text().splitlines()[-1]
+        say(f"sweeper installed: runs `offload sweep` at login and at :00, :15, :30, :45; first run: {last}")
+        if " FAILED" in last:
+            die(f"the first run failed; see {log}")
+    elif a.action == "uninstall":
+        SWEEPER_BIN.unlink(missing_ok=True)
+        say("sweeper uninstalled")
+    else:
+        r = subprocess.run(["launchctl", "print", f"{domain}/{SWEEPER_LABEL}"], capture_output=True, text=True)
+        if r.returncode:
+            say("sweeper not installed: `offload sweeper install`")
+        else:
+            say("sweeper installed: " + ", ".join(line.strip() for line in r.stdout.splitlines()  # top level only (one tab)
+                                                  if re.match(r"\t(state|runs|last exit code) =", line)))
+        try:
+            runs = (STATE / "sweeper.log").read_text().splitlines()[-5:]
+        except OSError:
+            runs = []
+        say("last runs:\n" + "\n".join(runs) if runs else "no runs logged yet")
+
+
+def cmd_ls(a):
+    now = time.time()
+    rows = servers()
+    for s in sorted(rows, key=lambda s: s["created"]):
+        labels, loc = s["labels"], (s.get("location") or {}).get("name") or s["datacenter"]["location"]["name"]
+        price = hourly_price(s["server_type"], loc) or 0
+        hours = max(1, math.ceil((now - iso_ts(s["created"])) / 3600))
+        expires = int(labels.get("offload-expires", "0") or 0)
+        here = "key here" if (read_info(s["name"].removeprefix(PREFIX)) or {}).get("run") == labels.get("offload-run") else "key elsewhere"
+        say(f"{s['name']:<34} {s['server_type']['name']:<6} {loc:<5} {s['status']:<9} owner {labels.get('offload-owner', '?'):<12} "
+            f"expires {clock(expires) if expires else '?':<16} {hours} h so far = {hours * price:.2f} EUR, {here}")
+    if not rows:
+        say("no offload servers")
+
+
+def cmd_types(a):
+    loc = a.location or LOCATIONS[0]
+    rows = []
+    for t in hjson("server-type", "list"):
+        where = {x["name"]: x for x in t.get("locations", [])}
+        if t.get("deprecated") or loc not in where or where[loc].get("deprecation"):
+            continue
+        price = hourly_price(t, loc)
+        if price is not None:
+            rows.append((price, t))
+    say(f"{'type':<7}{'cores':>6} {'cpu':<10}{'RAM':>6}{'disk':>7}  arch  EUR/h in {loc}  (live, Hetzner API)")
+    for price, t in sorted(rows, key=lambda r: r[0]):
+        say(f"{t['name']:<7}{t['cores']:>6} {t['cpu_type']:<10}{t['memory']:>4.0f}GB{t['disk']:>5}GB  {t['architecture']:<5} {price:.4f}")
+
+
+# ---------------------------------------------------------------- files and commands
+
+SAFE_PUSH_DIR = re.compile(r"/(root|srv|opt|tmp|mnt|home/[a-z_][a-z0-9_-]*)(/[A-Za-z0-9_][A-Za-z0-9._-]*)+")
+
+
+def cmd_push(a):
+    task = task_name(a.task)
+    info = need(task)
+    local = Path(a.local).resolve()
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", unicodedata.normalize("NFKD", local.name).encode("ascii", "ignore").decode()).strip(".-")
+    remote_dir = a.remote or f"/root/work/{slug or 'project'}"  # a folder called "My Project" goes to /root/work/My-Project
+    if not SAFE_PUSH_DIR.fullmatch(remote_dir) or remote_dir.startswith(JOBS):
+        die(f"remote folder {remote_dir!r}: push replaces it, so use a folder such as /root/work/<name>")
+    check_outgoing(remote_dir, *KEEP)
+    r = subprocess.run(["git", "-C", str(local), "ls-files", "-z", "--cached", "--others", "--exclude-standard"], capture_output=True)
+    if r.returncode:
+        die(f"{local} is not in a git work tree; use `offload put` for plain folders")
+    files, skipped = [], []
+    for rel in sorted({os.fsdecode(x) for x in r.stdout.split(b"\0") if x}):
+        p = local / rel
+        if p.is_symlink() or p.is_file():
+            files.append(rel)
+        elif p.is_dir():
+            skipped.append(rel)  # submodules and nested repositories
+    scan(local, files, a.allow)
+    if skipped:
+        say(f"not pushed (submodules or nested repositories): {', '.join(skipped[:10])}")
+    with tempfile.NamedTemporaryFile("wb", delete=False, dir=state_dir(task)) as lst:
+        lst.write(b"\0".join(os.fsencode(f) for f in files))
+    try:
+        tar_rc, ssh_rc = pipe_to_remote(["tar", "-czf", "-", "--no-recursion", "--null", "-T", lst.name], task, info, PUSH, remote_dir, *KEEP, cwd=local)
+    finally:
+        os.unlink(lst.name)
+    if tar_rc or ssh_rc:
+        die(f"push failed (tar {tar_rc}, ssh {ssh_rc}); the remote folder may be the old or the new tree, push again")
+
+
+def cmd_put(a):
+    task = task_name(a.task)
+    info = need(task)
+    check_outgoing(a.remote)
+    src = Path(a.local).expanduser()
+    if src.is_file():
+        src = src.resolve()  # a link is scanned and sent as its target
+        scan(src.parent, [src.name], a.allow)
+        with open(src, "rb") as f:
+            r = remote(task, info, 'mkdir -p "$(dirname "$1")" && cat > "$1" && chmod "$2" "$1"', a.remote, oct(src.stat().st_mode & 0o777)[2:], stdin=f)
+        if r.returncode:
+            die(f"put failed (exit {r.returncode})")
+    elif src.is_dir():
+        files = sorted(str(p.relative_to(src)) for p in src.rglob("*") if p.is_file() or p.is_symlink())
+        dirs = sorted(str(p.relative_to(src)) for p in src.rglob("*") if p.is_dir() and not p.is_symlink())
+        scan(src.resolve(), files, a.allow)
+        # Exactly the scanned list goes out (plus the folders, empty ones included): a file that appears later is not sent.
+        with tempfile.NamedTemporaryFile("wb", delete=False, dir=state_dir(task)) as lst:
+            lst.write(b"\0".join(os.fsencode(f) for f in dirs + files))
+        try:
+            rcs = pipe_to_remote(["tar", "-czf", "-", "--no-recursion", "--null", "-T", lst.name], task, info,
+                                 'mkdir -p "$1" && tar -xzf - -C "$1" --no-same-owner --warning=no-unknown-keyword --warning=no-timestamp',
+                                 a.remote, cwd=src)
+        finally:
+            os.unlink(lst.name)
+        if any(rcs):
+            die(f"put failed (tar {rcs[0]}, ssh {rcs[1]})")
+    else:
+        die(f"{src} not found")
+    say(f"put {src} -> {a.remote}")
+
+
+GIT_CONTROL = {".gitattributes", ".gitmodules", ".lfsconfig", ".gitconfig"}  # can steer git commands run here later
+
+
+def git_like(name):
+    """True for .git in any spelling the Mac's file system treats as .git (APFS ignores case and Unicode normalization),
+    and for any name with invisible format characters, which could disguise one."""
+    if any(unicodedata.category(c) == "Cf" for c in name):
+        return True
+    return unicodedata.normalize("NFC", name).casefold() == ".git"
+
+
+def fold(name):
+    """A name the way the Mac's file system compares it (APFS ignores case and Unicode normalization)."""
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+def names_in(path):
+    try:
+        return {fold(c.name) for c in path.iterdir()}
+    except OSError:
+        return set()
+
+
+def git_dir_names(names):
+    """git treats a folder as a repository (and honors its config, e.g. an fsmonitor command, for any git command
+    run inside it) when it holds HEAD with objects and refs, or HEAD with commondir (a worktree's admin folder)."""
+    return {"head", "objects", "refs"} <= names or {"head", "commondir"} <= names
+
+
+def check_get_target(src, dest):
+    """Results from the server must not plant or complete a git repository on the Mac."""
+    for p in [src, *src.rglob("*")]:
+        if fold(p.name) in ("head", "commondir", "gitdir"):
+            die(f"the server sent {p.name!r}, a name git uses for its own files; nothing copied")
+    for anc in [dest, *dest.parents]:
+        if git_like(anc.name) or (anc.is_dir() and git_dir_names(names_in(anc))):
+            die(f"{dest} is inside a git repository folder ({anc}); get does not write there. Nothing copied.")
+    if src.is_dir():  # after the merge, each folder holds its local names plus the received ones
+        for p in [src, *(q for q in src.rglob("*") if q.is_dir())]:
+            if git_dir_names(names_in(p) | names_in(dest / p.relative_to(src))):
+                die(f"merging into {dest / p.relative_to(src)} would make it look like a git repository; nothing copied")
+
+
+def cmd_get(a):
+    task = task_name(a.task)
+    info = need(task)
+    check_outgoing(a.remote)
+    expected = PurePosixPath(a.remote.rstrip("/")).name  # the only top-level name accepted from the server
+    if expected in ("", ".", ".."):
+        die("get needs the path of a file or folder on the server, not /, . or ..")
+    # Folders above the destination are the user's choice and may be links (/tmp is one on macOS): resolve them, so
+    # the checks below see the real place. The destination itself and everything below it must not be a link.
+    given = Path(os.path.abspath(Path(a.local).expanduser()))
+    dest = Path(os.path.realpath(given.parent)) / given.name
+    if dest.is_symlink():
+        die(f"{given} is a symlink; get does not write through links. Nothing copied.")
+    stage = Path(tempfile.mkdtemp(prefix="get-", dir=state_dir(task)))
+    try:
+        proc = subprocess.Popen([*ssh_args(task, info), remote_line(GET, a.remote)], stdout=subprocess.PIPE)
+        skipped, total, entries = 0, 0, 0
+        try:
+            # The server ran foreign code and chooses every name in the archive: only plain files and folders below the
+            # requested name, no links or devices, no .git (hooks would run here), no hidden files unless --hidden,
+            # and no more than OFFLOAD_GET_MAX_GB in total.
+            with tarfile.open(fileobj=proc.stdout, mode="r|gz") as archive:
+                for member in archive:
+                    parts = PurePosixPath(member.name).parts
+                    if not parts or parts[0] != expected:
+                        proc.kill()
+                        die(f"the server sent {member.name!r}, which is not inside {expected!r}; nothing copied")
+                    if any(git_like(p) or fold(p) in GIT_CONTROL for p in parts) or (not a.hidden and any(p.startswith(".") for p in parts)):
+                        proc.kill()
+                        die(f"the server sent {member.name!r}: .git in any spelling, git's control files (.gitattributes, "
+                            f".gitmodules, .lfsconfig ...) and names with invisible characters are always refused, other "
+                            f"hidden files only with --hidden; nothing copied")
+                    entries += 1  # every entry counts, also the skipped ones: their metadata costs memory too
+                    if not (member.isfile() or member.isdir()):
+                        skipped += 1
+                    else:
+                        total += member.size
+                    if total > GET_MAX_BYTES or entries > GET_MAX_ENTRIES:
+                        proc.kill()
+                        die(f"get {a.remote}: more than {GET_MAX_BYTES / 1e9:.0f} GB or {GET_MAX_ENTRIES} entries; nothing copied (OFFLOAD_GET_MAX_GB raises the size limit)")
+                    if not (member.isfile() or member.isdir()):
+                        continue
+                    try:
+                        archive.extract(member, stage, filter="data")
+                    except tarfile.FilterError:
+                        skipped += 1
+        except tarfile.ReadError:
+            proc.kill()
+            proc.wait()
+            die(f"get {a.remote}: nothing received")
+        if proc.wait():
+            die(f"get {a.remote} failed (ssh {proc.returncode}); nothing copied")
+        items = list(stage.iterdir())
+        if len(items) != 1 or items[0].name != expected:
+            die("unexpected archive content; nothing copied")
+        src = items[0]
+        for p in [src, *src.rglob("*")]:  # results are data: no execute bits from the server
+            os.chmod(p, 0o755 if p.is_dir() else 0o644)
+        if src.is_dir():
+            if dest.exists() and not dest.is_dir():
+                die(f"{dest} is a file and the server sent a folder; nothing copied")
+            parts = [p.relative_to(src) for p in src.rglob("*")]
+        else:
+            if dest.is_dir():  # dest itself is no link (checked above), so this stays where the user pointed
+                dest = dest / src.name
+            parts = []
+        # Never write through a link that already exists here: the server could aim it at any file on the Mac.
+        for rel in [Path(".")] + parts:
+            probe = dest
+            for part in rel.parts:
+                probe = probe / part
+                if probe.is_symlink():
+                    die(f"{probe} is a symlink; get does not write through links. Nothing copied.")
+        if dest.is_symlink() and src.is_file():
+            die(f"{dest} is a symlink; get does not write through links. Nothing copied.")
+        check_get_target(src, dest)
+        if src.is_dir():
+            shutil.copytree(src, dest, dirs_exist_ok=True)
+            count = sum(1 for p in src.rglob("*") if p.is_file())
+        else:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
+            count = 1
+        say(f"got {count} files into {dest}" + (f" ({skipped} links or special entries skipped)" if skipped else ""))
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+
+
+def cmd_exec(a):
+    task = task_name(a.task)
+    info = need(task)
+    command = " ".join(a.command).strip()
+    if not command:
+        die("no command given; put it after --, as one single-quoted string")
+    check_outgoing(command, a.cwd, a.detach)
+    if a.detach:
+        r = remote(task, info, DETACH, job_name(a.detach), a.cwd or "/root", input=command + "\n", text=True)
+        sys.exit(r.returncode)
+    if a.cwd:  # `cd x && a; b` would still run b in the home folder when cd fails: stop the whole command instead
+        command = f"cd -- {shlex.quote(a.cwd)} || exit 1\n{command}"
+    r = subprocess.run([*ssh_args(task, info), command])
+    if r.returncode == 255:
+        warn("exit 255: SSH failed (the command may or may not have run) or the command itself exited 255. Use --detach for long jobs.")
+    sys.exit(r.returncode)
+
+
+def show_tail(task, info, job, n):
+    remote(task, info, 'tail -n "$2" "$1"', f"{JOBS}/{job}.log", str(n), check=False)
+
+
+def cmd_wait(a):
+    task, job = task_name(a.task), job_name(a.job)
+    info = need(task)
+    start = time.time()
+    # 15 minutes before the expiry, so get still has time; less on a short-lived server (a 10m server gets 2.5 minutes)
+    deadline = info["expires"] - min(WAIT_MARGIN, (info["expires"] - info["created"]) // 4)
+    if a.timeout:
+        deadline = min(deadline, start + seconds(a.timeout))
+    beat = start
+    while True:
+        try:
+            r = remote(task, info, POLL, job, capture_output=True, text=True, timeout=60)
+            state = r.stdout.strip() if r.returncode == 0 else ""
+        except subprocess.TimeoutExpired:
+            state = ""
+        if state.startswith("exit "):
+            code = int(state.split()[1])
+            break
+        if state == "missing":
+            die(f"no job {job} on {PREFIX}{task}")
+        if state == "dead":
+            show_tail(task, info, job, 30)
+            die(f"job {job} ended without an exit status (killed, or the server rebooted)")
+        now = time.time()
+        if now >= deadline:
+            show_tail(task, info, job, 30)
+            die(f"stopped waiting at {clock(now)}; job {job} is still running. The server expires at {clock(info['expires'])}: "
+                f"get the results now, or wait again with a later --timeout.", 124)
+        if now - beat >= 300:
+            say(f"{(now - start) / 60:.0f} min: " + (state.replace("running", "running, last log line:", 1) if state else "server not reachable, retrying"))
+            beat = now
+        time.sleep(15)
+    show_tail(task, info, job, 30)
+    say(f"job {job} finished with exit status {code} after {(time.time() - start) / 60:.0f} min of waiting")
+    sys.exit(code)
+
+
+def cmd_logs(a):
+    task, job = task_name(a.task), job_name(a.job)
+    info = need(task)
+    if a.follow:
+        r = remote(task, info, 'tail -n "$2" -f --pid="$(cut -d" " -f1 "$1.pid")" "$1.log"', f"{JOBS}/{job}", str(a.n))
+    else:
+        r = remote(task, info, 'tail -n "$2" "$1.log"', f"{JOBS}/{job}", str(a.n))
+    sys.exit(r.returncode)
+
+
+# ---------------------------------------------------------------- base snapshots
+
+def snapshots(selector=""):
+    return hjson("image", "list", "--type", "snapshot", "-l", MANAGED + ("," + selector if selector else "")) or []
+
+
+def listing_images(selector):
+    """Like snapshots(), but None instead of exiting when the list is not readable (used during cleanup)."""
+    r = hcloud("image", "list", "--type", "snapshot", "-l", f"{MANAGED},{selector}", "-o", "json", check=False)
+    return None if r.returncode else (json.loads(r.stdout or "null") or [])
+
+
+def cmd_base(a):
+    if a.action == "ls":
+        rows = snapshots()
+        for i in sorted(rows, key=lambda i: i["created"]):
+            size = i.get("image_size") or 0
+            say(f"{i['labels'].get('offload-base', '?'):<16} id {i['id']:<10} {i['created'][:16]}  {i['architecture']}  disk {i['disk_size']:.0f} GB, "
+                f"stored {size:.2f} GB = {size * SNAPSHOT_EUR_GB_MONTH:.2f} EUR/month  {i['status']}")
+        if not rows:
+            say("no base snapshots")
+        return
+    base = a.base or die("name the base")
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,28}[a-z0-9])?", base):
+        die(f"base {base!r}: use 1-30 lowercase letters, digits and dashes")
+    if a.action == "rm":
+        rows = snapshots(f"offload-base={base}")
+        for i in rows:
+            hcloud("image", "delete", str(i["id"]))
+        say(f"{len(rows)} snapshots of base {base} deleted" if rows else f"no snapshot of base {base}")
+        return
+    task = f"base-{base}"
+    # create's task lock stays held until the builder is gone, so no rm or clean can step in between
+    held = cmd_create(argparse.Namespace(task=task, type=a.type, location=a.location, ttl="2h", base=None, setup=a.setup))  # noqa: F841
+    info = need(task)
+    try:
+        remote(task, info, SEAL, check=True)
+        for _ in range(36):
+            time.sleep(5)
+            if hjson("server", "describe", str(info["id"]))["status"] == "off":
+                break
+        else:
+            hcloud("server", "poweroff", str(info["id"]))
+        say("creating the snapshot (a few minutes) ...")
+        try:
+            hcloud("server", "create-image", "--type", "snapshot", "--description", f"offload base {base} {datetime.now():%Y-%m-%d}",
+                   "--label", MANAGED, "--label", f"offload-base={base}", "--label", f"offload-run={info['run']}", str(info["id"]))
+        except BaseException:
+            # Hetzner may have accepted the snapshot although hcloud failed: a half-made snapshot must not bill unnoticed.
+            half = listing_images(f"offload-run={info['run']}")
+            if half is None:
+                warn(f"snapshot list not readable: check `offload base ls` for a half-made snapshot of {base}")
+            for i in half or []:
+                if hcloud("image", "delete", str(i["id"]), check=False).returncode:
+                    warn(f"failed snapshot {i['id']} could not be deleted: remove it with `offload base rm {base}`")
+            raise
+    finally:
+        builder_gone = remove_run(task, info["run"])
+        if not builder_gone:
+            warn(f"the builder {PREFIX}{task} is still listed; run `offload rm {task}`")
+    rows = snapshots(f"offload-base={base}")
+    new = [i for i in rows if i["labels"].get("offload-run") == info["run"]]
+    if not new:
+        die("snapshot not found after creation")
+    for old in rows:
+        if old["id"] != new[0]["id"]:
+            hcloud("image", "delete", str(old["id"]))
+            say(f"older snapshot {old['id']} of base {base} deleted")
+    size = new[0].get("image_size") or 0
+    say(f"base {base}: snapshot {new[0]['id']}, stored {size:.2f} GB = about {size * SNAPSHOT_EUR_GB_MONTH:.2f} EUR/month while it exists. "
+        f"Start servers from it with `offload create <task> --from {base}`.")
+    if not builder_gone:
+        die(f"the builder {PREFIX}{task} may still bill: run `offload rm {task}`")
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # `offload ... | head` ends quietly
+    if sys.argv[1:2] == ["_watchdog"]:  # started by create; the token comes in through the environment
+        return cmd_watchdog(sys.argv[2:])
+    if sys.version_info < (3, 11) or not hasattr(tarfile, "data_filter"):
+        msg = f"needs Python 3.11 or newer (this is {sys.version.split()[0]} at {sys.executable}); for example `brew install python`"
+        if sys.argv[1:2] == ["sweep"]:
+            notify(f"offload sweeper cannot run: {msg}")
+        die(msg)
+    if sys.platform != "darwin":
+        die("macOS only for now: the watchdog and the sweeper rely on caffeinate and launchd. Linux support is welcome as a pull request.")
+    p = argparse.ArgumentParser(prog="offload", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("types")
+    s.add_argument("--location")
+    s = sub.add_parser("create")
+    s.add_argument("task")
+    s.add_argument("--type", default=DEFAULT_TYPE)
+    s.add_argument("--location")
+    s.add_argument("--ttl", default="4h")
+    s.add_argument("--from", dest="base")
+    s.add_argument("--setup", help="docker, or a local setup script")
+    s = sub.add_parser("push")
+    s.add_argument("task")
+    s.add_argument("local", nargs="?", default=".")
+    s.add_argument("remote", nargs="?")
+    s.add_argument("--allow", action="append", default=[])
+    s = sub.add_parser("put")
+    s.add_argument("task")
+    s.add_argument("local")
+    s.add_argument("remote")
+    s.add_argument("--allow", action="append", default=[])
+    s = sub.add_parser("get")
+    s.add_argument("task")
+    s.add_argument("remote")
+    s.add_argument("--hidden", action="store_true", help="also accept files and folders whose names start with a dot (never .git)")
+    s.add_argument("local")
+    s = sub.add_parser("exec")
+    s.add_argument("task")
+    s.add_argument("--detach", metavar="JOB")
+    s.add_argument("--cwd")
+    s = sub.add_parser("wait")
+    s.add_argument("task")
+    s.add_argument("job")
+    s.add_argument("--timeout")
+    s = sub.add_parser("logs")
+    s.add_argument("task")
+    s.add_argument("job")
+    s.add_argument("-n", type=int, default=40)
+    s.add_argument("-f", "--follow", action="store_true")
+    sub.add_parser("ls")
+    s = sub.add_parser("rm")
+    s.add_argument("tasks", nargs="+")
+    s = sub.add_parser("clean")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--mine", action="store_true")
+    g.add_argument("--owner")
+    g.add_argument("--all", action="store_true")
+    sub.add_parser("sweep", help="one cleanup run as the launchd job does it")
+    s = sub.add_parser("sweeper")
+    s.add_argument("action", choices=["install", "uninstall", "status"])
+    s = sub.add_parser("base")
+    s.add_argument("action", choices=["create", "ls", "rm"])
+    s.add_argument("base", nargs="?")
+    s.add_argument("--setup", default="docker")
+    s.add_argument("--type", default="cx23")
+    s.add_argument("--location")
+    argv = sys.argv[1:]
+    command = []
+    if argv[:1] == ["exec"]:  # everything after the first -- is the command, untouched by option parsing
+        if "--" not in argv:
+            die("exec: put the command after --, for example: offload exec <task> -- 'make -j16'")
+        command, argv = argv[argv.index("--") + 1:], argv[:argv.index("--")]
+    a = p.parse_args(argv)
+    a.command = command
+    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    refresh_bin()
+    if a.cmd in ("sweep", "sweeper"):  # sweep loads the token itself and logs a missing one
+        return {"sweep": cmd_sweep, "sweeper": cmd_sweeper}[a.cmd](a)
+    token = resolve_token()
+    if not token:
+        die(f"no Hetzner Cloud token: set ${TOKEN_VAR} (or name another variable in OFFLOAD_TOKEN_VAR), list a file that "
+            f"defines it in OFFLOAD_SECRET_FILES, or create an hcloud context (`hcloud context create <name>`). Nothing done.")
+    use_token(token)  # for hcloud and the watchdog: environment only, never a command line
+    {"types": cmd_types, "create": cmd_create, "push": cmd_push, "put": cmd_put, "get": cmd_get, "exec": cmd_exec, "wait": cmd_wait,
+     "logs": cmd_logs, "ls": cmd_ls, "rm": cmd_rm, "clean": cmd_clean, "base": cmd_base}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,29 @@
+{
+  "name": "offload-to-hetzner",
+  "description": "Offload heavy work from your Mac to short-lived Hetzner Cloud servers: a Claude Code plugin and Agent Skill, the Hetzner counterpart to Vercel's offload-to-sandbox.",
+  "owner": {
+    "name": "pipamann",
+    "url": "https://github.com/pipamann"
+  },
+  "plugins": [
+    {
+      "name": "offload-to-hetzner",
+      "source": "./",
+      "description": "Offload heavy builds, Docker, test suites and parallel agent work from your Mac to short-lived Hetzner Cloud servers. A Hetzner alternative to Vercel's offload-to-sandbox.",
+      "author": {
+        "name": "pipamann"
+      },
+      "repository": "https://github.com/pipamann/offload-to-hetzner",
+      "license": "MIT",
+      "keywords": [
+        "hetzner",
+        "hetzner-cloud",
+        "offload",
+        "sandbox",
+        "vercel-sandbox-alternative",
+        "remote-build",
+        "parallel-agents"
+      ]
+    }
+  ]
+}

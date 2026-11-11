@@ -1,0 +1,13 @@
+{
+  "name": "offload-to-hetzner",
+  "version": "1.0.0",
+  "description": "Offload heavy builds, Docker, test suites and parallel agent work from your Mac to short-lived Hetzner Cloud servers, with watchdog, launchd sweeper and secret scan. A Hetzner alternative to Vercel's offload-to-sandbox.",
+  "author": {
+    "name": "pipamann",
+    "url": "https://github.com/pipamann"
+  },
+  "homepage": "https://github.com/pipamann/offload-to-hetzner",
+  "repository": "https://github.com/pipamann/offload-to-hetzner",
+  "license": "MIT",
+  "keywords": ["hetzner", "hetzner-cloud", "offload", "sandbox", "vercel-sandbox-alternative", "remote-build", "docker", "test-suites", "parallel-agents", "hcloud"]
+}
