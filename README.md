@@ -40,6 +40,24 @@ Hetzner API, November 2026, without VAT):
 Pick Vercel when start time and per-millisecond billing matter, or when you need thousands of sandboxes at once.
 Pick Hetzner for builds and test suites that keep CPUs busy: several times cheaper, with twice the RAM per core.
 
+## When you don't need this
+
+A throwaway server per task pays off when heavy work comes in bursts and several agents run at once. Often
+something simpler is enough:
+
+- **One project, steady load:** keep one server. A Hetzner auction server (dedicated hardware for a flat monthly
+  price) or a cloud server that stays on needs no creating and no cleanup; give your agent SSH access and you are
+  done.
+- **The whole session on a server:** Claude Code can run a session on a remote machine over SSH, from the desktop
+  app or with `claude` in a terminal on the server. Then nothing heavy runs on the Mac in the first place. The
+  server runs all month, though, and whatever exists only on your Mac (its browser, local files, the keychain) is
+  not there.
+- **A machine now and then, by hand:** `hcloud server create` and `ssh` are all you need. This tool is a thin layer
+  on top of the `hcloud` CLI.
+
+Use this tool when your agents should stay on your Mac and rent machines only for the heavy parts, several at a
+time, without anyone having to remember to delete them.
+
 ## What it takes care of
 
 Hetzner has no automatic expiry, so a forgotten server bills until someone deletes it. Most of this skill is
